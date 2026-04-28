@@ -10,7 +10,7 @@ const CACHE_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct AnalysisCache {
-    pub files: HashMap<String, (String, Vec<FunctionMetrics<'static>>)>,
+    pub files: HashMap<String, (String, Vec<FunctionMetrics>)>,
 }
 
 #[derive(Serialize, Deserialize)]

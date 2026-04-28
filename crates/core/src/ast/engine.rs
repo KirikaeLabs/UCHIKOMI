@@ -1,6 +1,5 @@
 use crate::metrics::FunctionMetrics;
 use once_cell::sync::Lazy;
-use std::borrow::Cow;
 use tree_sitter::{Node, Query, QueryCursor};
 
 static FUNCTION_QUERY: Lazy<Query> = Lazy::new(|| {
@@ -44,7 +43,7 @@ impl<'a> ComplexityEngine<'a> {
         Self { source, file_path }
     }
 
-    pub fn analyze(&self, root_node: Node) -> Vec<FunctionMetrics<'a>> {
+    pub fn analyze(&self, root_node: Node) -> Vec<FunctionMetrics> {
         let mut functions = Vec::new();
         let mut cursor = QueryCursor::new();
         
@@ -61,16 +60,17 @@ impl<'a> ComplexityEngine<'a> {
         functions
     }
 
-    fn extract_metrics(&self, node: Node) -> Option<FunctionMetrics<'a>> {
-        let name = self.extract_name(node);
+    fn extract_metrics(&self, node: Node) -> Option<FunctionMetrics> {
+        let name = self.extract_name(node).to_string();
         let line = node.start_position().row as u32 + 1;
         let cyclomatic_complexity = self.calculate_cyclomatic_complexity(node);
         let (cognitive_complexity, nesting_depth) = self.calculate_cognitive_and_nesting(node);
         let lines_of_code = (node.end_position().row - node.start_position().row + 1) as u32;
 
         Some(FunctionMetrics {
-            name: Cow::Borrowed(name),
-            file: Cow::Borrowed(self.file_path),
+            id: format!("{}:{}:{}", self.file_path, name, line),
+            name,
+            file: self.file_path.to_string(),
             line,
             cyclomatic_complexity,
             cognitive_complexity,
@@ -80,6 +80,9 @@ impl<'a> ComplexityEngine<'a> {
             bug_fix_commits: 0,
             authors_count: 0,
             churn_score: 0.0,
+            normalized: None,
+            risk: None,
+            percentile: None,
         })
     }
 
