@@ -26,6 +26,12 @@ The engine is implemented in Rust, prioritizing zero-copy operations and data pa
 * **Streaming Telemetry:** Implements NDJSON (Newline Delimited JSON) output, enabling real-time metric consumption and $O(1)$ memory scaling relative to repository size.
 * **Hardened Error Handling:** Zero-panic architecture with exhaustive error propagation and graceful degradation for malformed source inputs.
 
+### 5. Advanced Infrastructure (Phase 4)
+* **Asynchronous Reporting:** Decoupled I/O using a channel-based NDJSON streamer with `BufWriter` for minimal syscall overhead.
+* **Persistent Cache Management:** Version-aware binary cache with automated invalidation and atomic signal-aware persistence.
+* **Query Memoization:** Pre-compiled AST queries shared via thread-safe contexts to eliminate redundant CPU cycles.
+* **Zero-Copy Optimization:** Leverages `Rayon` scoped threads to maintain source buffer lifetimes, eliminating heap allocations for metrics.
+
 ## Installation
 
 Build the optimized binary from the workspace root:
@@ -62,13 +68,6 @@ $$churn\_score = \frac{m \times b}{a}$$
 * **m**: Modification frequency.
 * **b**: Density of bug-fix commits (identified via commit message heuristics).
 * **a**: Contributor count (to identify knowledge silos or fragmentation).
-
-## Project Roadmap
-
-### Phase 3: High-Throughput Extensions (In Progress)
-* **Incremental Analysis:** Implementation of a persistence layer to cache file metrics based on Git OIDs. Only modified files will be re-parsed in subsequent runs.
-* **Streaming Output:** Transition from a unified JSON object to Newline Delimited JSON (NDJSON) to support streaming results and lower peak memory usage.
-* **SIMD Optimizations:** Exploring SIMD-accelerated scoring and string matching for commit message filtering.
 
 ## License
 
