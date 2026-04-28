@@ -1,0 +1,25 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# General
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Node (for future)
+node_modules/
+dist/
+build/
+*.node
+
+# Test
+test-repo/
