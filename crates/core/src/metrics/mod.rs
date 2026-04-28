@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionMetrics {
-    pub name: String,
-    pub file: String,
+pub struct FunctionMetrics<'a> {
+    pub name: Cow<'a, str>,
+    pub file: Cow<'a, str>,
     pub line: u32,
     pub cyclomatic_complexity: u32,
+    pub cognitive_complexity: u32,
     pub nesting_depth: u32,
     pub lines_of_code: u32,
     pub times_modified: usize,
@@ -15,11 +17,11 @@ pub struct FunctionMetrics {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Report {
+pub struct Report<'a> {
     pub repository: String,
     pub timestamp: String,
     pub summary: SummaryStats,
-    pub functions: Vec<FunctionMetrics>,
+    pub functions: Vec<FunctionMetrics<'a>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,86 +1,75 @@
-# ChurnLens
+ ChurnLens: High-Performance Code Telemetry
 
-ChurnLens is a high-performance static analysis tool designed to identify hotspots in TypeScript and JavaScript repositories. It correlates code complexity—derived from Abstract Syntax Tree (AST) traversal—with historical churn metrics extracted from Git metadata.
+ChurnLens is a specialized static analysis engine designed to quantify technical debt and stability risks in TypeScript and JavaScript repositories. It correlates Abstract Syntax Tree (AST) complexity with historical Git metadata to identify high-risk hotspots.
 
-## Technical Overview
+## Core Architecture
 
-The engine is built in Rust to ensure memory safety and computational efficiency during the analysis of large-scale monorepos. 
+The engine is implemented in Rust, prioritizing zero-copy operations and data parallelism to handle large-scale monorepos with minimal memory overhead.
 
-* **AST Parsing:** Utilizes `tree-sitter` for robust, incremental parsing of TypeScript and JavaScript source files.
-* **Git Mining:** Implements a single-pass `RevWalk` strategy via `libgit2` bindings. By traversing the commit graph once and caching OIDs, the tool avoids the $O(N \times M)$ overhead associated with per-file history queries.
-* **Concurrency:** Leverages the `Rayon` data-parallelism library to distribute file parsing and metric aggregation across all available CPU cores.
+### 1. Static Analysis Engine (AST)
+* **Query-Based Parsing:** Utilizes `tree-sitter` with declarative S-expression queries rather than imperative visitor patterns. This reduces pointer-chasing and leverages the underlying C-engine's optimized search.
+* **Zero-Copy Traversal:** Metrics extraction utilizes Rust lifetimes and `Cow<'a, str>` to reference source buffers directly, significantly reducing heap allocations during the analysis of large files.
+* **Complexity Metrics:**
+    * **Cyclomatic Complexity:** Measures linearly independent paths via AST decision points.
+    * **Cognitive Complexity:** Implements a nesting-aware metric that penalizes deeply branched logic, providing a more accurate representation of maintainability.
+
+### 2. Git Metadata Mining
+* **Single-Pass RevWalk:** Performs a single traversal of the repository history ($O(\text{Commits} + \text{Files})$). Metadata is aggregated into a hash-mapped cache, eliminating the $O(N \times M)$ bottleneck of per-function history queries.
+* **Resource Pooling:** A single `git2::Repository` handle is opened and passed by reference across worker threads to minimize I/O overhead.
+
+### 3. I/O and Concurrency
+* **Parallel Pipeline:** Uses `Rayon` for work-stealing parallelism. File-system walking, AST parsing, and Git mining are executed concurrently.
+* **Intelligent Discovery:** Integrates the `ignore` crate to natively respect `.gitignore` and `.ignore` files, ensuring only relevant source files are processed.
+
+### 4. High-Throughput Extensions (Phase 3)
+* **Incremental Analysis:** Persistence layer utilizing Git OID tracking to bypass redundant processing of unchanged files.
+* **Streaming Telemetry:** Implements NDJSON (Newline Delimited JSON) output, enabling real-time metric consumption and $O(1)$ memory scaling relative to repository size.
+* **Hardened Error Handling:** Zero-panic architecture with exhaustive error propagation and graceful degradation for malformed source inputs.
 
 ## Installation
 
-Compile from source using the Cargo package manager:
+Build the optimized binary from the workspace root:
 
 ```bash
 cargo build --release
 ```
 
-The resulting binary will be located at `./target/release/churnlens`.
-
 ## Usage
 
-ChurnLens operates as a CLI tool. It requires a path to a local Git repository.
-
 ```bash
-# Basic analysis with JSON output
-./churnlens /path/to/repo --output report.json
+# Analyze repository and output telemetry to JSON
+./target/release/churnlens [PATH] --output report.json
 
-# Filtered analysis limited to the src directory
-./churnlens /path/to/repo/src --limit 50
-
-# Sort by specific telemetry
-./churnlens . --sort churn_score
-./churnlens . --sort cyclomatic_complexity
+# Filter by churn score and limit output
+./target/release/churnlens . --sort churn_score --limit 50
 ```
 
-### CLI Arguments
+### CLI Configuration
 
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `path` | Path to the target directory or repository. | `.` |
-| `--output` | Path to save the generated JSON report. | `stdout` |
-| `--sort` | Metric used for ranking: `churn_score`, `complexity`, `modifications`. | `churn_score` |
-| `--limit` | Maximum number of entries in the output. | `20` |
+| `path` | Target directory for analysis. | `.` |
+| `--output` | Destination path for the report. | `stdout` |
+| `--sort` | Metric: `churn_score`, `complexity`, `modifications`. | `churn_score` |
+| `--limit` | Result set truncation. | `20` |
 
-## Analysis Metrics
+## Heuristics
 
-### Cyclomatic Complexity
-
-The tool measures the number of linearly independent paths through a function's source code. This is calculated by identifying decision points (if-statements, loops, conditional expressions) within the AST.
-
-### Risk Scoring (Churn)
-
-The `churn_score` identifies unstable code sections by calculating the intersection of modification frequency and bug-fix density. The current heuristic is defined as:
+The `churn_score` is a weighted metric used to identify the intersection of instability and complexity:
 
 $$churn\_score = \frac{m \times b}{a}$$
 
-Where:
-* $m$: Total times the file was modified in the analyzed history.
-* $b$: Number of commits identified as bug fixes (via commit message heuristics).
-* $a$: Total number of distinct authors contributing to the file.
+* **m**: Modification frequency.
+* **b**: Density of bug-fix commits (identified via commit message heuristics).
+* **a**: Contributor count (to identify knowledge silos or fragmentation).
 
-## Project Architecture
+## Project Roadmap
 
-The workspace is organized into a modular crate system to separate the core analysis engine from the CLI interface.
-
-```text
-ChurnLens/
-├── crates/core/
-│   ├── src/
-│   │   ├── ast/        # Tree-sitter parsers and complexity visitors
-│   │   ├── git/        # RevWalk logic and git2 integration
-│   │   ├── metrics/    # Scoring algorithms and data structures
-│   │   ├── error.rs    # Error propagation and recovery
-│   │   ├── lib.rs      # Main engine entry point
-│   │   └── main.rs     # CLI argument parsing and execution
-│   └── Cargo.toml
-├── Cargo.toml
-└── README.md
-```
+### Phase 3: High-Throughput Extensions (In Progress)
+* **Incremental Analysis:** Implementation of a persistence layer to cache file metrics based on Git OIDs. Only modified files will be re-parsed in subsequent runs.
+* **Streaming Output:** Transition from a unified JSON object to Newline Delimited JSON (NDJSON) to support streaming results and lower peak memory usage.
+* **SIMD Optimizations:** Exploring SIMD-accelerated scoring and string matching for commit message filtering.
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for the full text.
+MIT License. See `LICENSE` for details.

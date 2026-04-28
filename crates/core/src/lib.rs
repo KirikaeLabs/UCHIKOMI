@@ -7,59 +7,86 @@ use anyhow::Result;
 use ast::parser::TypeScriptAnalyzer;
 use git::GitAnalyzer;
 use git2::Repository;
+use ignore::WalkBuilder;
 use metrics::{FunctionMetrics, Report, SummaryStats};
-use rayon::prelude::*;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::borrow::Cow;
 
 pub fn analyze_repository(
     repo_path: &Path,
     sort_by: &str,
     limit: Option<usize>,
-) -> Result<Report> {
+) -> Result<Report<'static>> {
     log::info!("Analyzing repository: {}", repo_path.display());
 
     let repo = Repository::open(repo_path)?;
     let git_metrics = GitAnalyzer::get_all_file_metrics(&repo)?;
 
     let repo_path_abs = repo_path.canonicalize()?;
-    let files = collect_ts_files(&repo_path_abs)?;
+    
+    // Use ignore crate for efficient walking
+    let walker = WalkBuilder::new(&repo_path_abs)
+        .standard_filters(true)
+        .hidden(false) // we might want to see hidden files if they are JS/TS
+        .build_parallel();
 
-    let mut all_functions: Vec<FunctionMetrics> = files
-        .par_iter()
-        .flat_map(|file_path| {
-            match TypeScriptAnalyzer::parse_file(file_path.to_str().unwrap()) {
-                Ok(mut functions) => {
-                    // Try to get relative path to match Git metrics
-                    if let Ok(rel_path) = file_path.strip_prefix(&repo_path_abs) {
-                        let rel_path_str = rel_path.to_string_lossy().to_string();
-                        if let Some(churn) = git_metrics.get(&rel_path_str) {
-                            for func in &mut functions {
-                                func.times_modified = churn.times_modified;
-                                func.bug_fix_commits = churn.bug_fix_commits;
-                                func.authors_count = churn.authors_count;
-                                func.churn_score = churn.churn_score;
-                                func.file = rel_path_str.clone();
+    let all_functions = Arc::new(Mutex::new(Vec::new()));
+
+    walker.run(|| {
+        let all_functions = Arc::clone(&all_functions);
+        let repo_path_abs = repo_path_abs.clone();
+        let git_metrics = &git_metrics;
+
+        Box::new(move |entry| {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+
+            let path = entry.path();
+            if !path.is_file() {
+                return ignore::WalkState::Continue;
+            }
+
+            if let Some(ext) = path.extension() {
+                if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
+                    match TypeScriptAnalyzer::parse_file(path.to_str().unwrap()) {
+                        Ok(mut functions) => {
+                            if let Ok(rel_path) = path.strip_prefix(&repo_path_abs) {
+                                let rel_path_str = rel_path.to_string_lossy().to_string();
+                                if let Some(churn) = git_metrics.get(&rel_path_str) {
+                                    for func in &mut functions {
+                                        func.times_modified = churn.times_modified;
+                                        func.bug_fix_commits = churn.bug_fix_commits;
+                                        func.authors_count = churn.authors_count;
+                                        func.churn_score = churn.churn_score;
+                                        func.file = Cow::Owned(rel_path_str.clone());
+                                    }
+                                } else {
+                                    for func in &mut functions {
+                                        func.file = Cow::Owned(rel_path_str.clone());
+                                    }
+                                }
                             }
-                        } else {
-                            for func in &mut functions {
-                                func.file = rel_path_str.clone();
-                            }
+                            let mut all = all_functions.lock().unwrap();
+                            all.extend(functions);
                         }
+                        Err(e) => log::warn!("Failed to parse {}: {}", path.display(), e),
                     }
-                    functions
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse {}: {}", file_path.display(), e);
-                    Vec::new()
                 }
             }
+
+            ignore::WalkState::Continue
         })
-        .collect();
+    });
+
+    let mut all_functions = Arc::try_unwrap(all_functions).unwrap().into_inner().unwrap();
 
     let mut file_metrics: HashMap<String, usize> = HashMap::new();
     for func in &all_functions {
-        *file_metrics.entry(func.file.clone()).or_insert(0) +=
+        *file_metrics.entry(func.file.to_string()).or_insert(0) +=
             func.times_modified.max(1);
     }
 
@@ -81,47 +108,6 @@ pub fn analyze_repository(
     Ok(report)
 }
 
-fn collect_ts_files(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    walk_ts_files_recursive(path, &mut files)?;
-    Ok(files)
-}
-
-fn walk_ts_files_recursive(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if path.is_file() {
-        if let Some(ext) = path.extension() {
-            if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
-                files.push(path.to_path_buf());
-            }
-        }
-    } else if path.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with(".")
-                    || name_str == "node_modules"
-                    || name_str == "dist"
-                    || name_str == "build"
-                    || name_str == "target"
-                {
-                    continue;
-                }
-            }
-
-            walk_ts_files_recursive(&path, files)?;
-        }
-    }
-
-    Ok(())
-}
-
 fn sort_functions(functions: &mut [FunctionMetrics], sort_by: &str) {
     match sort_by {
         "churn_score" => functions.sort_by(|a, b| {
@@ -129,6 +115,9 @@ fn sort_functions(functions: &mut [FunctionMetrics], sort_by: &str) {
         }),
         "cyclomatic_complexity" => functions.sort_by(|a, b| {
             b.cyclomatic_complexity.cmp(&a.cyclomatic_complexity)
+        }),
+        "cognitive_complexity" => functions.sort_by(|a, b| {
+            b.cognitive_complexity.cmp(&a.cognitive_complexity)
         }),
         "times_modified" => functions.sort_by(|a, b| {
             b.times_modified.cmp(&a.times_modified)
