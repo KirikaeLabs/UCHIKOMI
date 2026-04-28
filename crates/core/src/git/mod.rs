@@ -10,7 +10,7 @@ use std::path::Path;
 pub struct GitAnalyzer;
 
 thread_local! {
-    static REPO_HANDLE: RefCell<Option<Repository>> = RefCell::new(None);
+    static REPO_HANDLE: RefCell<Option<Repository>> = const { RefCell::new(None) };
 }
 
 impl GitAnalyzer {
