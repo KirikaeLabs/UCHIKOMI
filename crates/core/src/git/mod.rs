@@ -1,79 +1,116 @@
 use crate::metrics::ChurnMetrics;
 use anyhow::Result;
-use git2::Repository;
-use std::collections::HashSet;
+use git2::{Commit, Repository};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 pub struct GitAnalyzer;
 
+struct FileStats {
+    times_modified: usize,
+    bug_fix_commits: usize,
+    authors: HashSet<String>,
+}
+
 impl GitAnalyzer {
-    pub fn analyze_file(repo_path: &str, file_path: &str) -> Result<ChurnMetrics> {
-        let repo = Repository::open(repo_path)?;
-
-        let mut times_modified = 0;
-        let mut bug_fix_commits = 0;
-        let mut authors = HashSet::new();
-
+    pub fn get_all_file_metrics(repo: &Repository) -> Result<HashMap<String, ChurnMetrics>> {
+        let mut stats_map: HashMap<String, FileStats> = HashMap::new();
         let mut revwalk = repo.revwalk()?;
         revwalk.push_head()?;
 
         for oid in revwalk {
             let oid = oid?;
             let commit = repo.find_commit(oid)?;
+            let author = commit.author().name().unwrap_or("Unknown").to_string();
+            let is_bug_fix = Self::is_bug_fix(&commit);
 
-            if Self::file_modified_in_commit(&repo, &commit, file_path)? {
-                times_modified += 1;
+            let modified_files = Self::get_modified_files(repo, &commit)?;
 
-                if let Some(author_name) = commit.author().name() {
-                    authors.insert(author_name.to_string());
+            for file_path in modified_files {
+                let stats = stats_map.entry(file_path).or_insert_with(|| FileStats {
+                    times_modified: 0,
+                    bug_fix_commits: 0,
+                    authors: HashSet::new(),
+                });
+
+                stats.times_modified += 1;
+                if is_bug_fix {
+                    stats.bug_fix_commits += 1;
                 }
+                stats.authors.insert(author.clone());
+            }
+        }
 
-                if let Some(message) = commit.message() {
-                    let lower_msg = message.to_lowercase();
-                    if lower_msg.contains("fix") || lower_msg.contains("bug") {
-                        bug_fix_commits += 1;
+        let result = stats_map
+            .into_iter()
+            .map(|(path, stats)| {
+                let authors_count = stats.authors.len();
+                let churn_score = if authors_count > 0 {
+                    (stats.times_modified as f64 * stats.bug_fix_commits as f64)
+                        / authors_count as f64
+                } else {
+                    stats.times_modified as f64
+                };
+
+                (
+                    path,
+                    ChurnMetrics {
+                        times_modified: stats.times_modified,
+                        bug_fix_commits: stats.bug_fix_commits,
+                        authors_count,
+                        churn_score,
+                    },
+                )
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    fn is_bug_fix(commit: &Commit) -> bool {
+        if let Some(message) = commit.message() {
+            let lower_msg = message.to_lowercase();
+            lower_msg.contains("fix") || lower_msg.contains("bug")
+        } else {
+            false
+        }
+    }
+
+    fn get_modified_files(repo: &Repository, commit: &Commit) -> Result<Vec<String>> {
+        let tree = commit.tree()?;
+        let mut files = Vec::new();
+
+        if commit.parent_count() > 0 {
+            for parent in commit.parents() {
+                let parent_tree = parent.tree()?;
+                let diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)?;
+                
+                for delta in diff.deltas() {
+                    if let Some(path) = delta.new_file().path() {
+                        if let Some(path_str) = path.to_str() {
+                            files.push(path_str.to_string());
+                        }
                     }
                 }
             }
-        }
-
-        let authors_count = authors.len();
-        let churn_score = if authors_count > 0 {
-            (times_modified as f64 * bug_fix_commits as f64) / authors_count as f64
         } else {
-            times_modified as f64
-        };
-
-        Ok(ChurnMetrics {
-            times_modified,
-            bug_fix_commits,
-            authors_count,
-            churn_score,
-        })
-    }
-
-    fn file_modified_in_commit(
-        repo: &Repository,
-        commit: &git2::Commit,
-        file_path: &str,
-    ) -> Result<bool> {
-        let tree = commit.tree()?;
-
-        let parent_tree = if commit.parent_count() > 0 {
-            commit.parent(0)?.tree()?
-        } else {
-            return Ok(true);
-        };
-
-        let diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)?;
-
-        for delta in diff.deltas() {
-            if let Some(path) = delta.new_file().path() {
-                if path.to_string_lossy().contains(file_path) {
-                    return Ok(true);
+            // Initial commit: all files are "modified"
+            let mut tree_entries = Vec::new();
+            tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+                if let Some(name) = entry.name() {
+                    let path = Path::new(root).join(name);
+                    if let Some(path_str) = path.to_str() {
+                        tree_entries.push(path_str.to_string());
+                    }
                 }
-            }
+                git2::TreeWalkResult::Ok
+            })?;
+            files = tree_entries;
         }
 
-        Ok(false)
+        // Deduplicate files if there are multiple parents (merges)
+        files.sort();
+        files.dedup();
+        Ok(files)
     }
 }

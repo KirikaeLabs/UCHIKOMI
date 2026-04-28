@@ -1,6 +1,6 @@
 use crate::metrics::FunctionMetrics;
 use std::fs;
-use tree_sitter::{Language, Parser};
+use tree_sitter::Parser;
 use tree_sitter_typescript::language_typescript;
 
 use super::visitor::ComplexityVisitor;

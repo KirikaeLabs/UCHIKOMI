@@ -6,9 +6,11 @@ pub mod metrics;
 use anyhow::Result;
 use ast::parser::TypeScriptAnalyzer;
 use git::GitAnalyzer;
+use git2::Repository;
 use metrics::{FunctionMetrics, Report, SummaryStats};
+use rayon::prelude::*;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn analyze_repository(
     repo_path: &Path,
@@ -17,30 +19,45 @@ pub fn analyze_repository(
 ) -> Result<Report> {
     log::info!("Analyzing repository: {}", repo_path.display());
 
-    let repo_path_str = repo_path.to_string_lossy().to_string();
-    let mut all_functions = Vec::new();
-    let mut file_metrics: HashMap<String, usize> = HashMap::new();
+    let repo = Repository::open(repo_path)?;
+    let git_metrics = GitAnalyzer::get_all_file_metrics(&repo)?;
 
-    walk_ts_files(repo_path, &mut |file_path| {
-        log::debug!("Analyzing file: {}", file_path.display());
+    let repo_path_abs = repo_path.canonicalize()?;
+    let files = collect_ts_files(&repo_path_abs)?;
 
-        match TypeScriptAnalyzer::parse_file(&file_path) {
-            Ok(mut functions) => {
-                for func in &mut functions {
-                    if let Ok(churn) = GitAnalyzer::analyze_file(&repo_path_str, &func.file) {
-                        func.times_modified = churn.times_modified;
-                        func.bug_fix_commits = churn.bug_fix_commits;
-                        func.authors_count = churn.authors_count;
-                        func.churn_score = churn.churn_score;
+    let mut all_functions: Vec<FunctionMetrics> = files
+        .par_iter()
+        .flat_map(|file_path| {
+            match TypeScriptAnalyzer::parse_file(file_path.to_str().unwrap()) {
+                Ok(mut functions) => {
+                    // Try to get relative path to match Git metrics
+                    if let Ok(rel_path) = file_path.strip_prefix(&repo_path_abs) {
+                        let rel_path_str = rel_path.to_string_lossy().to_string();
+                        if let Some(churn) = git_metrics.get(&rel_path_str) {
+                            for func in &mut functions {
+                                func.times_modified = churn.times_modified;
+                                func.bug_fix_commits = churn.bug_fix_commits;
+                                func.authors_count = churn.authors_count;
+                                func.churn_score = churn.churn_score;
+                                func.file = rel_path_str.clone();
+                            }
+                        } else {
+                            for func in &mut functions {
+                                func.file = rel_path_str.clone();
+                            }
+                        }
                     }
+                    functions
                 }
-
-                all_functions.extend(functions);
+                Err(e) => {
+                    log::warn!("Failed to parse {}: {}", file_path.display(), e);
+                    Vec::new()
+                }
             }
-            Err(e) => log::warn!("Failed to parse {}: {}", file_path.display(), e),
-        }
-    })?;
+        })
+        .collect();
 
+    let mut file_metrics: HashMap<String, usize> = HashMap::new();
     for func in &all_functions {
         *file_metrics.entry(func.file.clone()).or_insert(0) +=
             func.times_modified.max(1);
@@ -55,7 +72,7 @@ pub fn analyze_repository(
     let summary = calculate_summary(&all_functions, &file_metrics);
 
     let report = Report {
-        repository: repo_path_str,
+        repository: repo_path_abs.to_string_lossy().to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         summary,
         functions: all_functions,
@@ -64,18 +81,21 @@ pub fn analyze_repository(
     Ok(report)
 }
 
-fn walk_ts_files<F>(path: &Path, callback: &mut F) -> Result<()>
-where
-    F: FnMut(&Path),
-{
+fn collect_ts_files(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    walk_ts_files_recursive(path, &mut files)?;
+    Ok(files)
+}
+
+fn walk_ts_files_recursive(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     if !path.exists() {
-        return Err(anyhow::anyhow!("Path does not exist: {}", path.display()));
+        return Ok(());
     }
 
     if path.is_file() {
         if let Some(ext) = path.extension() {
             if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
-                callback(path);
+                files.push(path.to_path_buf());
             }
         }
     } else if path.is_dir() {
@@ -95,7 +115,7 @@ where
                 }
             }
 
-            walk_ts_files(&path, callback)?;
+            walk_ts_files_recursive(&path, files)?;
         }
     }
 

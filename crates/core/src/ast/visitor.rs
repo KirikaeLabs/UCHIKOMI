@@ -34,7 +34,7 @@ impl<'a> ComplexityVisitor<'a> {
 
     fn extract_function_metrics(&self, node: Node<'a>) -> Option<FunctionMetrics> {
         let name = self.extract_function_name(node)?;
-        let line = node.start_point().row as u32 + 1;
+        let line = node.start_position().row as u32 + 1;
         let cyclomatic_complexity = self.calculate_complexity(node);
         let nesting_depth = self.calculate_nesting_depth(node);
         let lines_of_code = self.calculate_loc(node);
@@ -131,8 +131,8 @@ impl<'a> ComplexityVisitor<'a> {
     }
 
     fn calculate_loc(&self, node: Node<'a>) -> u32 {
-        let start = node.start_point().row;
-        let end = node.end_point().row;
+        let start = node.start_position().row;
+        let end = node.end_position().row;
         (end - start + 1) as u32
     }
 
