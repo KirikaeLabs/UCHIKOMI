@@ -1,9 +1,15 @@
 [package]
-name = "churnlens-core"
+name = "churnlens"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+categories.workspace = true
+keywords.workspace = true
 
 [[bin]]
 name = "churnlens"
