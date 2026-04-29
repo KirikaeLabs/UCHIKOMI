@@ -7,7 +7,7 @@ pub mod metrics;
 use anyhow::Result;
 use ast::parser::TypeScriptAnalyzer;
 use cache::{AnalysisCache, CacheManager};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use git::GitAnalyzer;
 use git2::Repository;
 use ignore::WalkBuilder;
@@ -25,6 +25,7 @@ use std::sync::{
 };
 
 const SCHEMA_VERSION: &str = "0.1.0";
+const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
 
 pub fn analyze_repository(
     repo_path: &Path,
@@ -34,10 +35,21 @@ pub fn analyze_repository(
 ) -> Result<Report> {
     log::info!("Analyzing repository: {}", repo_path.display());
 
-    let repo = Repository::open(repo_path)?;
-    let head = repo.head()?;
-    let branch_name = head.shorthand().unwrap_or("unknown").to_string();
-    let commit_hash = head.peel_to_commit()?.id().to_string();
+    let repo = match Repository::open(repo_path) {
+        Ok(repo) => Some(repo),
+        Err(err) => {
+            log::warn!("Git repository unavailable: {}", err);
+            None
+        }
+    };
+    let (branch_name, commit_hash, timestamp) = match repo.as_ref() {
+        Some(repo) => repository_metadata(repo),
+        None => (
+            "unknown".to_string(),
+            String::new(),
+            FALLBACK_TIMESTAMP.to_string(),
+        ),
+    };
 
     let cache_manager = CacheManager::new(repo_path);
     let mut cache = match cache_manager.load() {
@@ -49,13 +61,23 @@ pub fn analyze_repository(
     };
 
     // Análise Incremental de Git preservando integridade de autores
-    let git_cache = GitAnalyzer::get_all_file_metrics(
-        &repo,
-        cache.git_cache.clone(),
-        cache.last_commit_oid.clone(),
-    )?;
+    let git_cache = match repo.as_ref() {
+        Some(repo) => match GitAnalyzer::get_all_file_metrics(
+            repo,
+            cache.git_cache.clone(),
+            cache.last_commit_oid.clone(),
+        ) {
+            Ok(git_cache) => git_cache,
+            Err(err) => {
+                log::warn!("Failed to collect Git metrics: {}", err);
+                HashMap::new()
+            }
+        },
+        None => HashMap::new(),
+    };
 
     let repo_path_abs = repo_path.canonicalize()?;
+    let repo_available = repo.is_some();
 
     let walker = WalkBuilder::new(&repo_path_abs)
         .standard_filters(true)
@@ -90,13 +112,17 @@ pub fn analyze_repository(
             let rel_path = path.strip_prefix(&repo_path_abs).ok()?;
             let rel_path_str = rel_path.to_string_lossy().to_string();
 
-            let current_oid = match GitAnalyzer::get_file_oid_tls(&repo_path_abs, rel_path) {
-                Ok(Some(oid)) => oid.to_string(),
-                Ok(None) => String::new(),
-                Err(err) => {
-                    log::warn!("Failed to read Git object for {}: {}", rel_path_str, err);
-                    String::new()
+            let current_oid = if repo_available {
+                match GitAnalyzer::get_file_oid_tls(&repo_path_abs, rel_path) {
+                    Ok(Some(oid)) => oid.to_string(),
+                    Ok(None) => String::new(),
+                    Err(err) => {
+                        log::warn!("Failed to read Git object for {}: {}", rel_path_str, err);
+                        String::new()
+                    }
                 }
+            } else {
+                String::new()
             };
 
             let mut functions =
@@ -169,7 +195,7 @@ pub fn analyze_repository(
                 repository: repo_path_abs.to_string_lossy().to_string(),
                 commit: commit_hash,
                 branch: branch_name,
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp,
             },
             summary: SummaryStats {
                 total_functions: 0,
@@ -351,7 +377,7 @@ pub fn analyze_repository(
             repository: repo_path_abs.to_string_lossy().to_string(),
             commit: commit_hash.clone(),
             branch: branch_name,
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp,
         },
         summary: SummaryStats {
             total_functions: functions.len(),
@@ -368,12 +394,46 @@ pub fn analyze_repository(
     // Finaliza cache com integridade Git total
     cache.files = new_cache_files;
     cache.git_cache = git_cache;
-    cache.last_commit_oid = Some(commit_hash);
+    cache.last_commit_oid = if commit_hash.is_empty() {
+        None
+    } else {
+        Some(commit_hash)
+    };
     if let Err(err) = cache_manager.save(cache) {
         log::warn!("Failed to save cache: {}", err);
     }
 
     Ok(report)
+}
+
+fn repository_metadata(repo: &Repository) -> (String, String, String) {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(err) => {
+            log::warn!("Git HEAD unavailable: {}", err);
+            return (
+                "unknown".to_string(),
+                String::new(),
+                FALLBACK_TIMESTAMP.to_string(),
+            );
+        }
+    };
+    let branch_name = head.shorthand().unwrap_or("unknown").to_string();
+
+    let commit = match head.peel_to_commit() {
+        Ok(commit) => commit,
+        Err(err) => {
+            log::warn!("Git HEAD commit unavailable: {}", err);
+            return (branch_name, String::new(), FALLBACK_TIMESTAMP.to_string());
+        }
+    };
+
+    let timestamp = commit_timestamp(&commit).unwrap_or_else(|| FALLBACK_TIMESTAMP.to_string());
+    (branch_name, commit.id().to_string(), timestamp)
+}
+
+fn commit_timestamp(commit: &git2::Commit) -> Option<String> {
+    DateTime::<Utc>::from_timestamp(commit.time().seconds(), 0).map(|dt| dt.to_rfc3339())
 }
 
 fn percentile_f64(sorted_values: &[f64], value: f64, total: f64) -> f64 {

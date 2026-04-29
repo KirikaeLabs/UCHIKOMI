@@ -49,9 +49,7 @@ fn main() -> Result<()> {
     })?;
 
     let report = analyze_repository(&args.path, &args.sort, args.limit, shutdown)?;
-    if report.summary.total_functions > 0 {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
 
     Ok(())
 }
