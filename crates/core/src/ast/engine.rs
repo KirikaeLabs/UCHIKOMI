@@ -270,7 +270,10 @@ mod tests {
 
         let function = find(&functions, "a");
 
-        assert!(function.cyclomatic_complexity > 1);
+        assert_eq!(function.cyclomatic_complexity, 2);
+        assert_eq!(function.cognitive_complexity, 1);
+        assert_eq!(function.nesting_depth, 1);
+        assert_eq!(function.lines_of_code, 3);
     }
 
     #[test]
@@ -290,8 +293,12 @@ mod tests {
 
         assert_eq!(outer.cyclomatic_complexity, 1);
         assert_eq!(outer.cognitive_complexity, 0);
+        assert_eq!(outer.nesting_depth, 0);
+        assert_eq!(outer.lines_of_code, 5);
         assert_eq!(inner.cyclomatic_complexity, 2);
         assert_eq!(inner.cognitive_complexity, 1);
+        assert_eq!(inner.nesting_depth, 1);
+        assert_eq!(inner.lines_of_code, 3);
     }
 
     #[test]
@@ -307,5 +314,8 @@ mod tests {
         let function = find(&functions, "f");
 
         assert_eq!(function.cyclomatic_complexity, 2);
+        assert_eq!(function.cognitive_complexity, 1);
+        assert_eq!(function.nesting_depth, 1);
+        assert_eq!(function.lines_of_code, 3);
     }
 }

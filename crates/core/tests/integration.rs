@@ -4,6 +4,13 @@ use std::fs;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[test]
 fn analyzes_small_git_repository() {
     let temp_dir = tempfile::tempdir().expect("temp dir should be created");
@@ -54,16 +61,74 @@ fn analyzes_small_git_repository() {
     assert_eq!(report.summary.total_functions, 2);
     assert_eq!(report.functions.len(), 2);
     assert!(report.analysis.commit.len() >= 40);
-    assert!(report
+
+    let mut sorted_ids: Vec<_> = report
         .functions
         .iter()
-        .all(|function| function.normalized.is_some()));
+        .map(|function| function.id.as_str())
+        .collect();
+    sorted_ids.sort();
+    let report_ids: Vec<_> = report
+        .functions
+        .iter()
+        .map(|function| function.id.as_str())
+        .collect();
+    assert_eq!(sorted_ids, report_ids);
+
     assert!(report
         .functions
         .iter()
         .all(|function| function.risk.is_some()));
-    assert!(report
+
+    let function_a = report
         .functions
         .iter()
-        .all(|function| function.percentile.is_some()));
+        .find(|function| function.name == "a")
+        .expect("function a should exist");
+    assert_eq!(function_a.cyclomatic_complexity, 2);
+    assert_eq!(function_a.cognitive_complexity, 1);
+    assert_eq!(function_a.nesting_depth, 1);
+    assert_eq!(function_a.lines_of_code, 3);
+    let normalized_a = function_a
+        .normalized
+        .as_ref()
+        .expect("function a should have normalized metrics");
+    assert_close(normalized_a.cyclomatic, 1.0);
+    assert_close(normalized_a.cognitive, 1.0);
+    assert_close(normalized_a.loc, 1.0);
+    let percentile_a = function_a
+        .percentile
+        .as_ref()
+        .expect("function a should have percentile metrics");
+    assert_close(percentile_a.risk, 50.0);
+    assert_close(percentile_a.cognitive, 50.0);
+
+    let function_b = report
+        .functions
+        .iter()
+        .find(|function| function.name == "b")
+        .expect("function b should exist");
+    assert_eq!(function_b.cyclomatic_complexity, 1);
+    assert_eq!(function_b.cognitive_complexity, 0);
+    assert_eq!(function_b.nesting_depth, 0);
+    assert_eq!(function_b.lines_of_code, 1);
+    let normalized_b = function_b
+        .normalized
+        .as_ref()
+        .expect("function b should have normalized metrics");
+    assert_close(
+        normalized_b.cyclomatic,
+        std::f64::consts::LN_2 / 3.0_f64.ln(),
+    );
+    assert_close(normalized_b.cognitive, 0.0);
+    assert_close(normalized_b.loc, 0.5);
+    let percentile_b = function_b
+        .percentile
+        .as_ref()
+        .expect("function b should have percentile metrics");
+    assert_close(percentile_b.risk, 0.0);
+    assert_close(percentile_b.cognitive, 0.0);
+
+    let json = serde_json::to_string(&report).expect("report should serialize");
+    assert!(json.contains("\"total_functions\":2"));
 }
