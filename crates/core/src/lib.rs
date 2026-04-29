@@ -338,6 +338,13 @@ pub fn analyze_repository(
     // Geração do Report Final
     let risk_p95 = risk_vals[p95_idx];
 
+    functions.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.name.cmp(&b.name))
+            .then(a.line.cmp(&b.line))
+    });
+
     let report = Report {
         schema_version: SCHEMA_VERSION.to_string(),
         analysis: AnalysisMetadata {
