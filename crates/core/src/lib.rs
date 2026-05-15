@@ -34,14 +34,17 @@ use std::sync::{
 };
 use xxhash_rust::xxh3::xxh3_128;
 
-const SCHEMA_VERSION: &str = "0.3.0";
+const SCHEMA_VERSION: &str = "0.4.0";
 const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
 
-const WEIGHT_COGNITIVE: f64 = 0.35;
-const WEIGHT_CYCLOMATIC: f64 = 0.15;
-const WEIGHT_CHURN: f64 = 0.30;
-const WEIGHT_LOC: f64 = 0.10;
-const WEIGHT_AUTHORS: f64 = 0.10;
+const WEIGHT_COGNITIVE: f64 = 0.30;
+const WEIGHT_CYCLOMATIC: f64 = 0.10;
+const WEIGHT_CHURN: f64 = 0.20;
+const WEIGHT_CHURN_RECENT: f64 = 0.15;
+const WEIGHT_FAN_IN: f64 = 0.10;
+const WEIGHT_LOC: f64 = 0.05;
+const WEIGHT_AUTHORS: f64 = 0.05;
+const WEIGHT_COVERAGE_GAP: f64 = 0.05;
 
 const THRESHOLD_CRITICAL: f64 = 95.0;
 const THRESHOLD_HIGH: f64 = 80.0;
@@ -59,6 +62,7 @@ struct RepoContext {
     cache_loaded: bool,
     repo_path_abs: std::path::PathBuf,
     config: ChurnLensConfig,
+    coverage: Option<CoverageIndex>,
 }
 
 #[derive(Default, Deserialize)]
@@ -73,12 +77,31 @@ struct GitConfig {
     bug_fix_patterns: Vec<String>,
 }
 
+#[derive(Default)]
+struct CoverageIndex {
+    files: HashMap<String, FileCoverageData>,
+}
+
+#[derive(Default)]
+struct FileCoverageData {
+    lines: HashMap<u32, u32>,
+    branches: Vec<BranchCoverageData>,
+}
+
+struct BranchCoverageData {
+    line: u32,
+    taken: bool,
+}
+
 struct NormalizationCaps {
     cognitive: f64,
     churn: f64,
+    churn_recent: f64,
     loc: f64,
     cyclomatic: f64,
     authors: f64,
+    fan_in: f64,
+    coverage_gap: f64,
 }
 
 struct ScoringContext {
@@ -185,14 +208,18 @@ pub fn analyze_repository_with_authors(
     warnings.extend(worker_warnings);
     skipped_files.extend(worker_skipped);
     git_cache.retain(|path, _| active_paths.contains(path));
+    apply_coverage(&mut functions, ctx.coverage.as_ref());
 
     let scoring_policy = ScoringPolicy {
         weights: metrics::Weights {
             cognitive: WEIGHT_COGNITIVE,
             cyclomatic: WEIGHT_CYCLOMATIC,
             churn: WEIGHT_CHURN,
+            churn_recent: WEIGHT_CHURN_RECENT,
+            fan_in: WEIGHT_FAN_IN,
             loc: WEIGHT_LOC,
             authors: WEIGHT_AUTHORS,
+            coverage_gap: WEIGHT_COVERAGE_GAP,
         },
         thresholds: metrics::Thresholds {
             critical: THRESHOLD_CRITICAL,
@@ -229,6 +256,7 @@ pub fn analyze_repository_with_authors(
             summary: SummaryStats {
                 total_functions: 0,
                 project_stats: build_project_stats(&functions, &git_cache, total_unique_authors),
+                coverage: build_project_coverage(&functions),
                 max_values: None,
                 distributions: None,
             },
@@ -237,8 +265,10 @@ pub fn analyze_repository_with_authors(
         });
     }
 
+    apply_coupling_and_reachability(&mut functions);
     let scoring_context = compute_scoring_context(&functions);
     let distributions = apply_scoring_and_labels(&mut functions, &scoring_context);
+    update_coverage_gaps(&mut functions);
     let project_stats = build_project_stats(&functions, &git_cache, total_unique_authors);
 
     sort_functions(&mut functions, sort_by, &mut warnings);
@@ -277,6 +307,7 @@ pub fn analyze_repository_with_authors(
         summary: SummaryStats {
             total_functions: functions.len(),
             project_stats,
+            coverage: build_project_coverage(&functions),
             max_values: Some(scoring_context.max_values),
             distributions: Some(distributions),
         },
@@ -498,7 +529,198 @@ fn build_project_stats(
         bus_factor,
         tech_debt_density,
         top_hotspots: hotspots,
+        dead_code: build_dead_code_stats(functions),
     }
+}
+
+fn build_dead_code_stats(functions: &[FunctionMetrics]) -> metrics::DeadCodeStats {
+    let unreachable = functions
+        .iter()
+        .filter(|function| !function.reachability.is_reachable)
+        .collect::<Vec<_>>();
+    metrics::DeadCodeStats {
+        unreachable_functions: unreachable.len(),
+        unreachable_loc: unreachable
+            .iter()
+            .map(|function| function.lines_of_code)
+            .sum(),
+        safe_to_delete: unreachable
+            .iter()
+            .filter(|function| function.reachability.kind == "unreachable_private")
+            .count(),
+    }
+}
+
+fn build_project_coverage(functions: &[FunctionMetrics]) -> Option<metrics::ProjectCoverage> {
+    let covered = functions
+        .iter()
+        .filter_map(|function| function.coverage.as_ref())
+        .collect::<Vec<_>>();
+    if covered.is_empty() {
+        return None;
+    }
+
+    let project_line_coverage = covered
+        .iter()
+        .map(|coverage| coverage.line_coverage)
+        .sum::<f64>()
+        / covered.len() as f64;
+    let high_risk_uncovered = functions
+        .iter()
+        .filter(|function| {
+            risk_score(function) >= 0.80
+                && function
+                    .coverage
+                    .as_ref()
+                    .is_some_and(|coverage| coverage.line_coverage < 0.50)
+        })
+        .count();
+
+    Some(metrics::ProjectCoverage {
+        available: true,
+        project_line_coverage,
+        high_risk_uncovered,
+    })
+}
+
+fn apply_coupling_and_reachability(functions: &mut [FunctionMetrics]) {
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        by_name
+            .entry(function.name.clone())
+            .or_default()
+            .push(index);
+    }
+
+    let mut callers_by_index: Vec<Vec<String>> = vec![Vec::new(); functions.len()];
+    let mut callees_by_index: Vec<Vec<String>> = vec![Vec::new(); functions.len()];
+    let mut reachable = vec![false; functions.len()];
+
+    for caller_index in 0..functions.len() {
+        let caller_ref = function_ref(&functions[caller_index]);
+        let raw_callees = functions[caller_index].coupling.callees.clone();
+        for callee_name in raw_callees {
+            let Some(targets) = by_name.get(&callee_name) else {
+                continue;
+            };
+            for &callee_index in targets {
+                if callee_index == caller_index {
+                    continue;
+                }
+                reachable[callee_index] = true;
+                callers_by_index[callee_index].push(caller_ref.clone());
+                callees_by_index[caller_index].push(function_ref(&functions[callee_index]));
+            }
+        }
+    }
+
+    for (index, function) in functions.iter_mut().enumerate() {
+        sort_and_dedup(&mut callers_by_index[index]);
+        sort_and_dedup(&mut callees_by_index[index]);
+
+        let fan_in = callers_by_index[index].len();
+        let fan_out = callees_by_index[index].len();
+        let denominator = fan_in + fan_out;
+        function.coupling = metrics::CouplingMetrics {
+            fan_in,
+            fan_out,
+            callers: callers_by_index[index].clone(),
+            callees: callees_by_index[index].clone(),
+            instability: if denominator == 0 {
+                0.0
+            } else {
+                fan_out as f64 / denominator as f64
+            },
+        };
+
+        let public_or_exported = function.reachability.kind == "unreachable_export";
+        if reachable[index] || public_or_exported || function.name == "main" {
+            function.reachability.is_reachable = true;
+            function.reachability.kind = if function.file.contains("/tests/")
+                || function.file.ends_with("_test.rs")
+                || function.file.ends_with(".test.ts")
+                || function.file.ends_with(".spec.ts")
+            {
+                "test_only".to_string()
+            } else {
+                "reachable".to_string()
+            };
+        }
+    }
+}
+
+fn apply_coverage(functions: &mut [FunctionMetrics], coverage: Option<&CoverageIndex>) {
+    let Some(coverage) = coverage else {
+        return;
+    };
+
+    for function in functions {
+        let Some(file_coverage) = coverage.files.get(&function.file) else {
+            continue;
+        };
+
+        let covered_lines = file_coverage
+            .lines
+            .iter()
+            .filter(|(line, hits)| {
+                **line >= function.line && **line <= function.end_line && **hits > 0
+            })
+            .count();
+        let relevant_lines = file_coverage
+            .lines
+            .keys()
+            .filter(|line| **line >= function.line && **line <= function.end_line)
+            .count();
+        let line_coverage = if relevant_lines == 0 {
+            0.0
+        } else {
+            covered_lines as f64 / relevant_lines as f64
+        };
+
+        let branch_total = file_coverage
+            .branches
+            .iter()
+            .filter(|branch| branch.line >= function.line && branch.line <= function.end_line)
+            .count();
+        let branch_coverage = if branch_total == 0 {
+            None
+        } else {
+            let branch_covered = file_coverage
+                .branches
+                .iter()
+                .filter(|branch| {
+                    branch.line >= function.line && branch.line <= function.end_line && branch.taken
+                })
+                .count();
+            Some(branch_covered as f64 / branch_total as f64)
+        };
+
+        function.coverage = Some(metrics::CoverageMetrics {
+            available: true,
+            line_coverage,
+            branch_coverage,
+            covered_by: Vec::new(),
+            risk_coverage_gap: 1.0 - line_coverage,
+        });
+    }
+}
+
+fn update_coverage_gaps(functions: &mut [FunctionMetrics]) {
+    for function in functions {
+        let risk_score = risk_score(function);
+        if let Some(coverage) = function.coverage.as_mut() {
+            coverage.risk_coverage_gap = risk_score * (1.0 - coverage.line_coverage);
+        }
+    }
+}
+
+fn function_ref(function: &FunctionMetrics) -> String {
+    format!("{}:{}", function.file, function.name)
+}
+
+fn sort_and_dedup(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
 }
 
 fn build_quality(
@@ -718,6 +940,7 @@ fn load_repository_context(
             || !cache.git_cache.is_empty()
             || cache.last_commit_oid.is_some());
     let config = load_config(&repo_path_abs, warnings);
+    let coverage = load_coverage_index(&repo_path_abs, warnings);
 
     Ok(RepoContext {
         repo,
@@ -729,6 +952,7 @@ fn load_repository_context(
         cache_loaded,
         repo_path_abs,
         config,
+        coverage,
     })
 }
 
@@ -758,6 +982,106 @@ fn load_config(repo_path: &Path, warnings: &mut Vec<AnalysisWarning>) -> ChurnLe
             ChurnLensConfig::default()
         }
     }
+}
+
+fn load_coverage_index(
+    repo_path: &Path,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> Option<CoverageIndex> {
+    let coverage_path = repo_path.join("coverage").join("lcov.info");
+    let content = match std::fs::read_to_string(&coverage_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "coverage_read_failed".to_string(),
+                message: format!("Failed to read {}: {err}", coverage_path.display()),
+            });
+            return None;
+        }
+    };
+
+    match parse_lcov(&content, repo_path) {
+        Ok(index) => Some(index),
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "coverage_parse_failed".to_string(),
+                message: format!("Failed to parse {}: {err}", coverage_path.display()),
+            });
+            None
+        }
+    }
+}
+
+fn parse_lcov(content: &str, repo_path: &Path) -> Result<CoverageIndex> {
+    let mut index = CoverageIndex::default();
+    let mut current_file: Option<String> = None;
+    let mut current_data = FileCoverageData::default();
+
+    for line in content.lines() {
+        if let Some(path) = line.strip_prefix("SF:") {
+            if let Some(file) = current_file.replace(normalize_coverage_path(path, repo_path)) {
+                index.files.insert(file, current_data);
+                current_data = FileCoverageData::default();
+            }
+            continue;
+        }
+
+        if let Some(data) = line.strip_prefix("DA:") {
+            if let Some((line_no, hits)) = parse_line_coverage(data) {
+                current_data.lines.insert(line_no, hits);
+            }
+            continue;
+        }
+
+        if let Some(data) = line.strip_prefix("BRDA:") {
+            if let Some(branch) = parse_branch_coverage(data) {
+                current_data.branches.push(branch);
+            }
+            continue;
+        }
+
+        if line == "end_of_record" {
+            if let Some(file) = current_file.take() {
+                index.files.insert(file, current_data);
+                current_data = FileCoverageData::default();
+            }
+        }
+    }
+
+    if let Some(file) = current_file {
+        index.files.insert(file, current_data);
+    }
+
+    Ok(index)
+}
+
+fn normalize_coverage_path(path: &str, repo_path: &Path) -> String {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.strip_prefix(repo_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        path.to_string_lossy().to_string()
+    }
+}
+
+fn parse_line_coverage(data: &str) -> Option<(u32, u32)> {
+    let mut parts = data.split(',');
+    let line = parts.next()?.parse().ok()?;
+    let hits = parts.next()?.parse().ok()?;
+    Some((line, hits))
+}
+
+fn parse_branch_coverage(data: &str) -> Option<BranchCoverageData> {
+    let mut parts = data.split(',');
+    let line = parts.next()?.parse().ok()?;
+    let _block = parts.next()?;
+    let _branch = parts.next()?;
+    let taken = parts.next()? != "-";
+    Some(BranchCoverageData { line, taken })
 }
 
 fn collect_git_analysis(
@@ -950,6 +1274,7 @@ fn analyze_files_parallel(
                     } else {
                         None
                     };
+                    func.churn = GitAnalyzer::churn_details(&churn);
                     func.churn_score = churn.churn_score;
                     func.file = rel_path_str.clone();
                 }
@@ -1014,12 +1339,27 @@ fn compute_scoring_context(functions: &[FunctionMetrics]) -> ScoringContext {
     let mut loc_vals: Vec<u32> = functions.iter().map(|f| f.lines_of_code).collect();
     let mut cyc_vals: Vec<u32> = functions.iter().map(|f| f.cyclomatic_complexity).collect();
     let mut auth_vals: Vec<usize> = functions.iter().map(|f| f.authors_count).collect();
+    let mut recent_churn_vals: Vec<f64> =
+        functions.iter().map(|f| f.churn.windows.d7.score).collect();
+    let mut fan_in_vals: Vec<usize> = functions.iter().map(|f| f.coupling.fan_in).collect();
+    let mut coverage_gap_vals: Vec<f64> = functions
+        .iter()
+        .map(|f| {
+            f.coverage
+                .as_ref()
+                .map(|coverage| coverage.risk_coverage_gap)
+                .unwrap_or(0.0)
+        })
+        .collect();
 
     cog_vals.sort();
     churn_vals.sort_by(|a, b| a.total_cmp(b));
     loc_vals.sort();
     cyc_vals.sort();
     auth_vals.sort();
+    recent_churn_vals.sort_by(|a, b| a.total_cmp(b));
+    fan_in_vals.sort();
+    coverage_gap_vals.sort_by(|a, b| a.total_cmp(b));
 
     let p95_idx = (functions.len() * 95 / 100).min(functions.len() - 1);
     let p99_idx = (functions.len() * 99 / 100).min(functions.len() - 1);
@@ -1029,12 +1369,18 @@ fn compute_scoring_context(functions: &[FunctionMetrics]) -> ScoringContext {
     let loc_p95 = loc_vals[p95_idx] as f64;
     let cyc_p95 = cyc_vals[p95_idx] as f64;
     let auth_p95 = auth_vals[p95_idx] as f64;
+    let recent_churn_p95 = recent_churn_vals[p95_idx];
+    let fan_in_p95 = fan_in_vals[p95_idx] as f64;
+    let coverage_gap_p95 = coverage_gap_vals[p95_idx];
 
     let cognitive_p99 = cog_vals[p99_idx] as f64;
     let churn_p99 = churn_vals[p99_idx];
     let loc_p99 = loc_vals[p99_idx] as f64;
     let cyc_p99 = cyc_vals[p99_idx] as f64;
     let auth_p99 = auth_vals[p99_idx] as f64;
+    let recent_churn_p99 = recent_churn_vals[p99_idx];
+    let fan_in_p99 = fan_in_vals[p99_idx] as f64;
+    let coverage_gap_p99 = coverage_gap_vals[p99_idx];
 
     let cap_cog = if (max_values.cognitive as f64) > 3.0 * cognitive_p95 {
         cognitive_p99
@@ -1066,15 +1412,36 @@ fn compute_scoring_context(functions: &[FunctionMetrics]) -> ScoringContext {
         *auth_vals.iter().max().unwrap_or(&0) as f64
     }
     .max(1.0);
+    let cap_recent_churn = if *recent_churn_vals.last().unwrap_or(&0.0) > 3.0 * recent_churn_p95 {
+        recent_churn_p99
+    } else {
+        *recent_churn_vals.last().unwrap_or(&0.0)
+    }
+    .max(1.0);
+    let cap_fan_in = if (*fan_in_vals.last().unwrap_or(&0) as f64) > 3.0 * fan_in_p95 {
+        fan_in_p99
+    } else {
+        *fan_in_vals.last().unwrap_or(&0) as f64
+    }
+    .max(1.0);
+    let cap_coverage_gap = if *coverage_gap_vals.last().unwrap_or(&0.0) > 3.0 * coverage_gap_p95 {
+        coverage_gap_p99
+    } else {
+        *coverage_gap_vals.last().unwrap_or(&0.0)
+    }
+    .max(1.0);
 
     ScoringContext {
         max_values,
         caps: NormalizationCaps {
             cognitive: cap_cog,
             churn: cap_churn,
+            churn_recent: cap_recent_churn,
             loc: cap_loc,
             cyclomatic: cap_cyc,
             authors: cap_auth,
+            fan_in: cap_fan_in,
+            coverage_gap: cap_coverage_gap,
         },
         cog_vals,
         churn_vals,
@@ -1091,24 +1458,40 @@ fn apply_scoring_and_labels(
         let norm_cog = normalized_value(func.cognitive_complexity as f64, context.caps.cognitive);
         let norm_cyc = normalized_value(func.cyclomatic_complexity as f64, context.caps.cyclomatic);
         let norm_churn = normalized_value(func.churn_score, context.caps.churn);
+        let norm_recent_churn =
+            normalized_value(func.churn.windows.d7.score, context.caps.churn_recent);
         let norm_loc = normalized_value(func.lines_of_code as f64, context.caps.loc);
         let norm_auth = normalized_value(func.authors_count as f64, context.caps.authors);
+        let norm_fan_in = normalized_value(func.coupling.fan_in as f64, context.caps.fan_in);
+        let coverage_gap = func
+            .coverage
+            .as_ref()
+            .map(|coverage| coverage.risk_coverage_gap)
+            .unwrap_or(0.0);
+        let norm_coverage_gap = normalized_value(coverage_gap, context.caps.coverage_gap);
 
         func.normalized = Some(NormalizedMetrics {
             cyclomatic: norm_cyc,
             churn: norm_churn,
+            churn_recent: norm_recent_churn,
             cognitive: norm_cog,
+            fan_in: norm_fan_in,
             loc: norm_loc,
             authors: norm_auth,
+            coverage_gap: norm_coverage_gap,
         });
 
         let base_score = (WEIGHT_COGNITIVE * norm_cog)
             + (WEIGHT_CYCLOMATIC * norm_cyc)
             + (WEIGHT_CHURN * norm_churn)
+            + (WEIGHT_CHURN_RECENT * norm_recent_churn)
+            + (WEIGHT_FAN_IN * norm_fan_in)
             + (WEIGHT_LOC * norm_loc)
-            + (WEIGHT_AUTHORS * norm_auth);
+            + (WEIGHT_AUTHORS * norm_auth)
+            + (WEIGHT_COVERAGE_GAP * norm_coverage_gap);
         let nesting_penalty = 1.0 + (func.nesting_depth as f64 / 4.0).powi(2) * 0.20;
-        let final_score = base_score * nesting_penalty;
+        let fan_in_multiplier = 1.0 + norm_fan_in * 0.25;
+        let final_score = base_score * nesting_penalty * fan_in_multiplier;
 
         func.risk = Some(RiskMetrics {
             base_score,
@@ -1153,9 +1536,12 @@ fn apply_scoring_and_labels(
             let mut drivers = [
                 ("cognitive", norm.cognitive),
                 ("churn", norm.churn),
+                ("churn_recent", norm.churn_recent),
+                ("fan_in", norm.fan_in),
                 ("cyclomatic", norm.cyclomatic),
                 ("loc", norm.loc),
                 ("authors", norm.authors),
+                ("coverage_gap", norm.coverage_gap),
             ];
             drivers.sort_by(|a, b| b.1.total_cmp(&a.1));
             if let Some(risk) = func.risk.as_mut() {

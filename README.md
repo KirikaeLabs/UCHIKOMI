@@ -92,8 +92,14 @@ ChurnLens produces a single, machine-consumable JSON document.
       "total_unique_authors": integer,
       "bus_factor": integer,
       "tech_debt_density": number,
-      "top_hotspots": []
+      "top_hotspots": [],
+      "dead_code": {
+        "unreachable_functions": integer,
+        "unreachable_loc": integer,
+        "safe_to_delete": integer
+      }
     },
+    "coverage": null,
     "max_values": { "cyclomatic", "cognitive", "churn", "loc" },
     "distributions": { "risk_p95", "churn_p95", "cognitive_p95" }
   },
@@ -125,6 +131,10 @@ ChurnLens produces a single, machine-consumable JSON document.
 | `has_docstring` | `bool` | True when a leading RustDoc/JSDoc/Doxygen-style comment is present. |
 | `documentation_quality` | `string` | `missing`, `sparse`, or `adequate`. |
 | `identifier_verbosity` | `f64` | Average length of identifiers found inside the function. |
+| `churn` | `object` | Temporal churn details with `score`, `last_modified`, `windows`, and `velocity`. |
+| `coverage` | `object \| null` | Optional coverage details when coverage data is available. |
+| `coupling` | `object` | Static fan-in/fan-out, callers, callees, and instability. |
+| `reachability` | `object` | Static reachability classification. |
 | `churn_score` | `f64` | Refined historical volatility score. |
 | `normalized` | `object` | Fields scaled [0.0, 1.0] with outlier protection. |
 | `risk` | `object` | `base_score`, `nesting_penalty`, and `final_score`. |
@@ -135,11 +145,26 @@ The `quality.status` field is `partial` when analysis completed but some data co
 
 Consumers should treat `quality.status = "partial"` as a non-authoritative report unless their workflow explicitly accepts partial telemetry.
 
+### Configuration
+ChurnLens reads an optional `churnlens.toml` from the analyzed repository root.
+
+```toml
+[git]
+bug_fix_patterns = ["(?i)\\bfix(?:e[sd])?\\b", "JIRA-[0-9]+"]
+```
+
+When `bug_fix_patterns` is omitted or empty, ChurnLens uses its built-in bug-fix patterns.
+
 ### Metric Semantics
-* AST cache invalidation uses a stable hash of the current file contents, so dirty working-tree files are reparsed.
+* AST cache invalidation uses a 128-bit XxHash3 hash of the current file contents, so dirty working-tree files are reparsed.
 * Git churn is attributed by changed-line hunks when line data is available. Rename-only commits are treated as full-file changes to preserve history continuity.
+* Churn velocity is derived by comparing the 7-day modification rate against the 90-day modification rate.
+* Coverage fields are omitted as `null` unless ChurnLens can load `coverage/lcov.info` from the repository root.
+* Coupling and reachability are static best-effort metrics based on calls found in supported ASTs; dynamic dispatch and reflection are not resolved.
+* Changing configured bug-fix patterns invalidates Git churn cache metadata and rebuilds Git metrics.
 * Bug-fix commits are detected from word-like commit-message tokens such as `fix`, `bug`, `issue`, `close`, and `resolve`.
 * Author identity uses Git author email when available, falling back to author name.
+* File reads are concurrency-limited; files at or above 1 MiB are read via memory mapping.
 * Normalized values are capped at `1.0`.
 * Percentile ranks use `0.0` for the lowest value and `100.0` for the highest value when at least two functions are present.
 

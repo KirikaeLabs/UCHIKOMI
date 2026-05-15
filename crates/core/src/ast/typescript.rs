@@ -44,39 +44,55 @@ impl LanguageSupport for TypeScriptSupport {
     }
 
     fn extract_name(&self, node: Node, source: &str) -> String {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "identifier" || child.kind() == "property_identifier" {
-                return match child.utf8_text(source.as_bytes()) {
-                    Ok(text) => text.to_string(),
-                    Err(_) => "<unknown>".to_string(),
-                };
-            }
-        }
-
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "variable_declarator" || parent.kind() == "public_field_definition"
-            {
-                let mut p_cursor = parent.walk();
-                for child in parent.children(&mut p_cursor) {
-                    if child.kind() == "identifier" || child.kind() == "property_identifier" {
-                        return match child.utf8_text(source.as_bytes()) {
-                            Ok(text) => text.to_string(),
-                            Err(_) => "<unknown>".to_string(),
-                        };
-                    }
-                }
-            }
-            if parent.kind() == "assignment_expression" {
-                if let Some(left) = parent.child_by_field_name("left") {
-                    return match left.utf8_text(source.as_bytes()) {
-                        Ok(text) => text.to_string(),
-                        Err(_) => "<unknown>".to_string(),
-                    };
-                }
-            }
-        }
-
-        "<anonymous>".to_string()
+        direct_identifier(node, source)
+            .or_else(|| parent_binding_name(node, source))
+            .or_else(|| assignment_name(node, source))
+            .unwrap_or_else(|| "<anonymous>".to_string())
     }
+}
+
+fn direct_identifier(node: Node, source: &str) -> Option<String> {
+    first_identifier_child(node, source)
+}
+
+fn parent_binding_name(node: Node, source: &str) -> Option<String> {
+    let parent = node.parent()?;
+    if matches!(
+        parent.kind(),
+        "variable_declarator" | "public_field_definition"
+    ) {
+        first_identifier_child(parent, source)
+    } else {
+        None
+    }
+}
+
+fn assignment_name(node: Node, source: &str) -> Option<String> {
+    let parent = node.parent()?;
+    if parent.kind() != "assignment_expression" {
+        return None;
+    }
+    parent
+        .child_by_field_name("left")
+        .and_then(|left| node_text(left, source))
+}
+
+fn first_identifier_child(node: Node, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let identifier = node
+        .children(&mut cursor)
+        .find(|child| is_identifier_kind(child.kind()))
+        .and_then(|child| node_text(child, source));
+    identifier
+}
+
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(kind, "identifier" | "property_identifier")
+}
+
+fn node_text(node: Node, source: &str) -> Option<String> {
+    node.utf8_text(source.as_bytes())
+        .ok()
+        .map(str::to_string)
+        .or_else(|| Some("<unknown>".to_string()))
 }

@@ -1,4 +1,4 @@
-use crate::metrics::FunctionMetrics;
+use crate::metrics::{ChurnDetails, CouplingMetrics, FunctionMetrics, ReachabilityMetrics};
 use anyhow::Result;
 use tree_sitter::Node;
 use xxhash_rust::xxh3::xxh3_128;
@@ -36,6 +36,12 @@ struct BodyQuality {
     has_docstring: bool,
     documentation_quality: String,
     identifier_verbosity: f64,
+}
+
+struct NodeState {
+    entered_function: bool,
+    child_depth: u32,
+    logical_operator: Option<&'static str>,
 }
 
 impl<'a> ComplexityEngine<'a> {
@@ -80,77 +86,107 @@ impl<'a> ComplexityEngine<'a> {
         depth: u32,
         last_op: Option<&'static str>,
     ) {
-        let entered_function = if self.support.is_function(node) {
-            let name = self.support.extract_name(node, self.source);
-            let start_line = node.start_position().row as u32 + 1;
-            let output_index = functions.len();
-            functions.push(None);
-            stack.push(FunctionState {
-                id: self.function_id(node, &name),
-                name,
-                start_line,
-                cyclomatic: 1,
-                cognitive: 0,
-                max_nesting: 0,
-                output_index,
-            });
-            true
-        } else {
-            false
-        };
-
-        let active_depth = if entered_function { 0 } else { depth };
-        let mut child_depth = active_depth;
-
-        if let Some(function) = stack.last_mut() {
-            let kind = node.kind();
-            if !entered_function && self.support.is_complexity_increment(node) {
-                function.cyclomatic += 1;
-            }
-
-            match kind {
-                "if_statement" | "for_statement" | "while_statement" | "do_statement"
-                | "switch_statement" | "catch_clause" | "ternary_expression" | "if_expression"
-                | "match_expression" | "match_arm" => {
-                    let is_else_if = kind == "if_statement"
-                        && node.parent().is_some_and(|p| p.kind() == "else_clause");
-
-                    if is_else_if {
-                        function.cognitive += 1;
-                    } else {
-                        function.cognitive += 1 + active_depth;
-                        child_depth += 1;
-                    }
-                }
-                "binary_expression" => {
-                    if let Some(op) = logical_operator(node) {
-                        if last_op != Some(op) {
-                            function.cognitive += 1;
-                        }
-
-                        if child_depth > function.max_nesting {
-                            function.max_nesting = child_depth;
-                        }
-
-                        if entered_function {
-                            traversal_stack.push(TraversalEvent::ExitFunction(node));
-                        }
-                        self.push_children(node, traversal_stack, child_depth, Some(op));
-                        return;
-                    }
-                }
-                _ => {}
-            }
-
-            if child_depth > function.max_nesting {
-                function.max_nesting = child_depth;
-            }
-        }
-
-        if entered_function {
+        let entered_function = self.enter_function_if_needed(node, stack, functions);
+        let state = self.process_complexity_node(node, stack, depth, entered_function, last_op);
+        if state.entered_function {
             traversal_stack.push(TraversalEvent::ExitFunction(node));
         }
-        self.push_children(node, traversal_stack, child_depth, None);
+        self.push_children(
+            node,
+            traversal_stack,
+            state.child_depth,
+            state.logical_operator,
+        );
+    }
+
+    fn enter_function_if_needed(
+        &self,
+        node: Node,
+        stack: &mut Vec<FunctionState>,
+        functions: &mut Vec<Option<FunctionMetrics>>,
+    ) -> bool {
+        if !self.support.is_function(node) {
+            return false;
+        }
+
+        let name = self.support.extract_name(node, self.source);
+        let start_line = node.start_position().row as u32 + 1;
+        let output_index = functions.len();
+        functions.push(None);
+        stack.push(FunctionState {
+            id: self.function_id(node, &name),
+            name,
+            start_line,
+            cyclomatic: 1,
+            cognitive: 0,
+            max_nesting: 0,
+            output_index,
+        });
+        true
+    }
+
+    fn process_complexity_node(
+        &self,
+        node: Node,
+        stack: &mut [FunctionState],
+        depth: u32,
+        entered_function: bool,
+        last_op: Option<&'static str>,
+    ) -> NodeState {
+        let active_depth = if entered_function { 0 } else { depth };
+        let mut state = NodeState {
+            entered_function,
+            child_depth: active_depth,
+            logical_operator: None,
+        };
+
+        if let Some(function) = stack.last_mut() {
+            self.increment_cyclomatic(node, function, entered_function);
+            self.increment_cognitive(node, function, active_depth, last_op, &mut state);
+            function.max_nesting = function.max_nesting.max(state.child_depth);
+        }
+
+        state
+    }
+
+    fn increment_cyclomatic(
+        &self,
+        node: Node,
+        function: &mut FunctionState,
+        entered_function: bool,
+    ) {
+        if !entered_function && self.support.is_complexity_increment(node) {
+            function.cyclomatic += 1;
+        }
+    }
+
+    fn increment_cognitive(
+        &self,
+        node: Node,
+        function: &mut FunctionState,
+        active_depth: u32,
+        last_op: Option<&'static str>,
+        state: &mut NodeState,
+    ) {
+        match node.kind() {
+            kind if is_nesting_complexity_node(kind) => {
+                if is_else_if(node, kind) {
+                    function.cognitive += 1;
+                } else {
+                    function.cognitive += 1 + active_depth;
+                    state.child_depth += 1;
+                }
+            }
+            "binary_expression" => {
+                if let Some(op) = logical_operator(node) {
+                    if last_op != Some(op) {
+                        function.cognitive += 1;
+                    }
+                    state.logical_operator = Some(op);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn push_children<'tree>(
@@ -179,6 +215,7 @@ impl<'a> ComplexityEngine<'a> {
         let end_line = node.end_position().row as u32 + 1;
         let lines_of_code = end_line - function.start_line + 1;
         let quality = self.analyze_body_quality(node, function.cognitive);
+        let callees = collect_call_names(node, self.source, self.support);
         functions[function.output_index] = Some(FunctionMetrics {
             id: function.id,
             name: function.name,
@@ -202,7 +239,17 @@ impl<'a> ComplexityEngine<'a> {
             bug_fix_commits: 0,
             authors_count: 0,
             authors: None,
+            churn: ChurnDetails::default(),
             churn_score: 0.0,
+            coverage: None,
+            coupling: CouplingMetrics {
+                callees,
+                ..CouplingMetrics::default()
+            },
+            reachability: ReachabilityMetrics {
+                is_reachable: false,
+                kind: initial_reachability_kind(node),
+            },
             normalized: None,
             risk: None,
             percentile: None,
@@ -308,6 +355,29 @@ fn logical_operator(node: Node) -> Option<&'static str> {
         }
     }
     None
+}
+
+fn is_nesting_complexity_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_statement"
+            | "for_statement"
+            | "while_statement"
+            | "do_statement"
+            | "switch_statement"
+            | "catch_clause"
+            | "ternary_expression"
+            | "if_expression"
+            | "match_expression"
+            | "match_arm"
+    )
+}
+
+fn is_else_if(node: Node, kind: &str) -> bool {
+    kind == "if_statement"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "else_clause")
 }
 
 fn function_signature_text(node: Node, source: &str) -> String {
@@ -443,6 +513,87 @@ fn is_identifier_node(kind: &str) -> bool {
         kind,
         "identifier" | "property_identifier" | "field_identifier" | "type_identifier"
     )
+}
+
+fn collect_call_names(node: Node, source: &str, support: &dyn LanguageSupport) -> Vec<String> {
+    let mut calls = Vec::new();
+    let mut stack = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        stack.push(child);
+    }
+
+    while let Some(current) = stack.pop() {
+        if current != node && support.is_function(current) {
+            continue;
+        }
+        if is_call_node(current.kind()) {
+            if let Some(name) = call_name(current, source) {
+                calls.push(name);
+            }
+        }
+
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    calls.sort();
+    calls.dedup();
+    calls
+}
+
+fn is_call_node(kind: &str) -> bool {
+    matches!(kind, "call_expression" | "macro_invocation")
+}
+
+fn call_name(node: Node, source: &str) -> Option<String> {
+    let target = node
+        .child_by_field_name("function")
+        .or_else(|| node.child_by_field_name("name"))
+        .or_else(|| node.named_child(0))?;
+    target
+        .utf8_text(source.as_bytes())
+        .ok()
+        .map(normalize_call_name)
+        .filter(|name| !name.is_empty())
+}
+
+fn normalize_call_name(text: &str) -> String {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+        .filter(|part| !part.is_empty())
+        .next_back()
+        .unwrap_or_default()
+        .trim_matches(':')
+        .to_string()
+}
+
+fn initial_reachability_kind(node: Node) -> String {
+    if is_exported_or_public(node) {
+        "unreachable_export".to_string()
+    } else {
+        "unreachable_private".to_string()
+    }
+}
+
+fn is_exported_or_public(node: Node) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "export_statement" | "public_field_definition" | "visibility_modifier"
+        ) {
+            return true;
+        }
+        if let Some(previous) = candidate.prev_sibling() {
+            if previous.kind() == "pub" || previous.kind() == "export" {
+                return true;
+            }
+        }
+        current = candidate.parent();
+    }
+    false
 }
 
 #[cfg(test)]

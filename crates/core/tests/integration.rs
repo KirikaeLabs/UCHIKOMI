@@ -77,7 +77,7 @@ fn analyzes_small_git_repository() {
     let report =
         analyze_repository(repo_path, "file", None, shutdown()).expect("repository should analyze");
 
-    assert_eq!(report.schema_version, "0.3.0");
+    assert_eq!(report.schema_version, "0.4.0");
     assert_eq!(report.quality.status, AnalysisStatus::Complete);
     assert!(report.quality.warnings.is_empty());
     assert!(report.quality.skipped_files.is_empty());
@@ -318,6 +318,105 @@ fn honors_custom_bug_fix_patterns() {
 
     assert_eq!(function.bug_fix_commits, 1);
     assert_eq!(function.body_hash.len(), 32);
+}
+
+#[test]
+fn reports_temporal_churn_coupling_and_reachability() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+    write_source(
+        repo_path,
+        r#"
+        export function entry() {
+            helper();
+        }
+
+        function helper() {
+            return 1;
+        }
+
+        function unused() {
+            return 2;
+        }
+        "#,
+    );
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    assert!(report.summary.coverage.is_none());
+    assert!(report.summary.project_stats.dead_code.unreachable_functions >= 1);
+
+    let entry = report
+        .functions
+        .iter()
+        .find(|function| function.name == "entry")
+        .expect("entry function should exist");
+    assert_eq!(entry.coupling.fan_out, 1);
+    assert_eq!(entry.churn.times_modified, entry.times_modified);
+    assert!(entry.churn.last_modified.is_some());
+
+    let helper = report
+        .functions
+        .iter()
+        .find(|function| function.name == "helper")
+        .expect("helper function should exist");
+    assert_eq!(helper.coupling.fan_in, 1);
+    assert_eq!(helper.reachability.kind, "reachable");
+
+    let unused = report
+        .functions
+        .iter()
+        .find(|function| function.name == "unused")
+        .expect("unused function should exist");
+    assert_eq!(unused.reachability.kind, "unreachable_private");
+}
+
+#[test]
+fn applies_lcov_coverage_to_function_ranges() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+    write_source(
+        repo_path,
+        r#"
+        function covered() {
+            return 1;
+        }
+        "#,
+    );
+    let coverage_dir = repo_path.join("coverage");
+    fs::create_dir_all(&coverage_dir).expect("coverage dir should be created");
+    fs::write(
+        coverage_dir.join("lcov.info"),
+        "SF:src/index.ts\nDA:2,1\nDA:3,0\nDA:4,1\nBRDA:3,0,0,0\nBRDA:3,0,1,-\nend_of_record\n",
+    )
+    .expect("coverage file should be written");
+
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    let coverage = report
+        .summary
+        .coverage
+        .as_ref()
+        .expect("project coverage should be available");
+    assert!(coverage.available);
+
+    let function = report
+        .functions
+        .iter()
+        .find(|function| function.name == "covered")
+        .expect("covered function should exist");
+    let function_coverage = function
+        .coverage
+        .as_ref()
+        .expect("function coverage should be available");
+    assert!(function_coverage.available);
+    assert!(function_coverage.line_coverage > 0.0);
+    assert!(function_coverage.risk_coverage_gap >= 0.0);
 }
 
 #[test]

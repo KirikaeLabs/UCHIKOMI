@@ -1,5 +1,5 @@
 use crate::cache::{GitCacheEntry, GitCacheMetadata, LineChange, GIT_ALGORITHM_VERSION};
-use crate::metrics::ChurnMetrics;
+use crate::metrics::{ChurnDetails, ChurnMetrics, ChurnWindow, ChurnWindows};
 use anyhow::{anyhow, Result};
 use git2::{Commit, Delta, DiffDelta, DiffFindOptions, DiffHunk, DiffOptions, Oid, Repository};
 use rayon::prelude::*;
@@ -174,6 +174,7 @@ impl GitAnalyzer {
         let churn_score = (cache_entry.times_modified as f64
             + (cache_entry.bug_fix_commits as f64 * 2.0))
             * (authors_count as f64 + 1.0).log10();
+        let windows = ChurnWindows::default();
 
         ChurnMetrics {
             times_modified: cache_entry.times_modified,
@@ -181,6 +182,9 @@ impl GitAnalyzer {
             authors_count,
             authors: cache_entry.authors.iter().cloned().collect(),
             churn_score,
+            last_modified: None,
+            windows,
+            velocity: "stable".to_string(),
         }
     }
 
@@ -196,6 +200,7 @@ impl GitAnalyzer {
         let mut commits = HashSet::new();
         let mut bug_fix_commits = HashSet::new();
         let mut authors = HashSet::new();
+        let mut matched_changes = Vec::new();
 
         for change in &cache_entry.line_changes {
             if ranges_overlap(start_line, end_line, change.start_line, change.end_line) {
@@ -204,6 +209,7 @@ impl GitAnalyzer {
                     bug_fix_commits.insert(change.commit.clone());
                 }
                 authors.insert(change.author.clone());
+                matched_changes.push(change);
             }
         }
 
@@ -214,12 +220,22 @@ impl GitAnalyzer {
                 authors_count: 0,
                 authors: Vec::new(),
                 churn_score: 0.0,
+                last_modified: None,
+                windows: ChurnWindows::default(),
+                velocity: "stable".to_string(),
             };
         }
 
         let authors_count = authors.len().max(1);
         let churn_score = (commits.len() as f64 + (bug_fix_commits.len() as f64 * 2.0))
             * (authors_count as f64 + 1.0).log10();
+        let last_timestamp = matched_changes
+            .iter()
+            .map(|change| change.timestamp)
+            .max()
+            .unwrap_or_default();
+        let windows = churn_windows(&matched_changes, authors_count, last_timestamp);
+        let velocity = churn_velocity(&windows);
 
         ChurnMetrics {
             times_modified: commits.len(),
@@ -227,6 +243,19 @@ impl GitAnalyzer {
             authors_count,
             authors: authors.into_iter().collect(),
             churn_score,
+            last_modified: format_timestamp(last_timestamp),
+            windows,
+            velocity,
+        }
+    }
+
+    pub fn churn_details(metrics: &ChurnMetrics) -> ChurnDetails {
+        ChurnDetails {
+            score: metrics.churn_score,
+            times_modified: metrics.times_modified,
+            last_modified: metrics.last_modified.clone(),
+            windows: metrics.windows.clone(),
+            velocity: metrics.velocity.clone(),
         }
     }
 
@@ -406,6 +435,7 @@ impl GitAnalyzer {
         let commit = repo.find_commit(oid)?;
         let author = Self::author_identity(&commit);
         let is_bug_fix = Self::is_bug_fix(&commit, bug_fix_patterns);
+        let timestamp = commit.time().seconds();
         let modified_files = Self::get_modified_files_optimized(repo, &commit)?;
 
         let mut metrics = HashMap::new();
@@ -430,6 +460,7 @@ impl GitAnalyzer {
                     end_line: range.end_line,
                     is_bug_fix,
                     author: author.clone(),
+                    timestamp,
                 });
             }
         }
@@ -632,4 +663,57 @@ fn changed_range_from_hunk(hunk: DiffHunk) -> ChangedRange {
 
 fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> bool {
     left_start <= right_end && right_start <= left_end
+}
+
+fn churn_windows(
+    changes: &[&LineChange],
+    authors_count: usize,
+    reference_timestamp: i64,
+) -> ChurnWindows {
+    ChurnWindows {
+        d7: churn_window(changes, authors_count, reference_timestamp, 7),
+        d30: churn_window(changes, authors_count, reference_timestamp, 30),
+        d90: churn_window(changes, authors_count, reference_timestamp, 90),
+    }
+}
+
+fn churn_window(
+    changes: &[&LineChange],
+    authors_count: usize,
+    reference_timestamp: i64,
+    days: i64,
+) -> ChurnWindow {
+    let cutoff = reference_timestamp.saturating_sub(days * 24 * 60 * 60);
+    let modifications = changes
+        .iter()
+        .filter(|change| change.timestamp >= cutoff)
+        .map(|change| &change.commit)
+        .collect::<HashSet<_>>()
+        .len();
+    ChurnWindow {
+        modifications,
+        score: (modifications as f64) * (authors_count as f64 + 1.0).log10(),
+    }
+}
+
+fn churn_velocity(windows: &ChurnWindows) -> String {
+    let d7_rate = windows.d7.modifications as f64 / 7.0;
+    let d90_rate = windows.d90.modifications as f64 / 90.0;
+
+    if d90_rate == 0.0 {
+        return "stable".to_string();
+    }
+
+    let ratio = d7_rate / d90_rate;
+    if ratio >= 1.25 {
+        "accelerating".to_string()
+    } else if ratio <= 0.75 {
+        "cooling".to_string()
+    } else {
+        "stable".to_string()
+    }
+}
+
+fn format_timestamp(timestamp: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0).map(|dt| dt.to_rfc3339())
 }

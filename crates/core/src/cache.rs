@@ -7,8 +7,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC: &[u8; 4] = b"CHRN";
-const CACHE_VERSION: u32 = 5;
-pub const GIT_ALGORITHM_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 6;
+pub const GIT_ALGORITHM_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct AnalysisCache {
@@ -39,6 +39,7 @@ pub struct LineChange {
     pub end_line: u32,
     pub is_bug_fix: bool,
     pub author: String,
+    pub timestamp: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
