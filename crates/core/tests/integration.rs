@@ -77,7 +77,7 @@ fn analyzes_small_git_repository() {
     let report =
         analyze_repository(repo_path, "file", None, shutdown()).expect("repository should analyze");
 
-    assert_eq!(report.schema_version, "0.2.0");
+    assert_eq!(report.schema_version, "0.3.0");
     assert_eq!(report.quality.status, AnalysisStatus::Complete);
     assert!(report.quality.warnings.is_empty());
     assert!(report.quality.skipped_files.is_empty());

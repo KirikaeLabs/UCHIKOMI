@@ -88,6 +88,12 @@ ChurnLens produces a single, machine-consumable JSON document.
   },
   "summary": {
     "total_functions": integer,
+    "project_stats": {
+      "total_unique_authors": integer,
+      "bus_factor": integer,
+      "tech_debt_density": number,
+      "top_hotspots": []
+    },
     "max_values": { "cyclomatic", "cognitive", "churn", "loc" },
     "distributions": { "risk_p95", "churn_p95", "cognitive_p95" }
   },
@@ -105,10 +111,20 @@ ChurnLens produces a single, machine-consumable JSON document.
 ### Function Object
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `id` | `string` | Stable identifier (`file:name:line`). |
+| `id` | `string` | Stable identifier based on file, function name, and signature hash. |
 | `name` | `string` | Function identifier or `<anonymous>`. |
 | `file` | `string` | Relative path from repository root. |
 | `line` | `u32` | Start line number. |
+| `end_line` | `u32` | End line number. |
+| `body_hash` | `string` | Stable hash of the function body. |
+| `executable_statements` | `u32` | Count of executable statements detected in the function body. |
+| `is_hollow` | `bool` | True when the function body has no executable statements. |
+| `hollow_kind` | `string` | `none`, `empty`, or `comment_only`. |
+| `comment_ratio` | `f64` | Ratio of comment lines to non-empty lines inside the function. |
+| `placeholder_count` | `usize` | Count of placeholder terms such as TODO, FIXME, or generic names. |
+| `has_docstring` | `bool` | True when a leading RustDoc/JSDoc/Doxygen-style comment is present. |
+| `documentation_quality` | `string` | `missing`, `sparse`, or `adequate`. |
+| `identifier_verbosity` | `f64` | Average length of identifiers found inside the function. |
 | `churn_score` | `f64` | Refined historical volatility score. |
 | `normalized` | `object` | Fields scaled [0.0, 1.0] with outlier protection. |
 | `risk` | `object` | `base_score`, `nesting_penalty`, and `final_score`. |
@@ -121,7 +137,7 @@ Consumers should treat `quality.status = "partial"` as a non-authoritative repor
 
 ### Metric Semantics
 * AST cache invalidation uses a stable hash of the current file contents, so dirty working-tree files are reparsed.
-* Git churn is file-path based. Rename detection propagates historical metrics to the new path, but complex copy/split histories are not treated as semantic code identity tracking.
+* Git churn is attributed by changed-line hunks when line data is available. Rename-only commits are treated as full-file changes to preserve history continuity.
 * Bug-fix commits are detected from word-like commit-message tokens such as `fix`, `bug`, `issue`, `close`, and `resolve`.
 * Author identity uses Git author email when available, falling back to author name.
 * Normalized values are capped at `1.0`.

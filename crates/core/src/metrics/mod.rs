@@ -6,14 +6,23 @@ pub struct FunctionMetrics {
     pub name: String,
     pub file: String,
     pub line: u32,
+    pub end_line: u32,
+    pub body_hash: String,
     pub cyclomatic_complexity: u32,
     pub cognitive_complexity: u32,
     pub nesting_depth: u32,
     pub lines_of_code: u32,
+    pub executable_statements: u32,
+    pub is_hollow: bool,
+    pub hollow_kind: String,
+    pub comment_ratio: f64,
+    pub placeholder_count: usize,
+    pub has_docstring: bool,
+    pub documentation_quality: String,
+    pub identifier_verbosity: f64,
     pub times_modified: usize,
     pub bug_fix_commits: usize,
     pub authors_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub authors: Option<Vec<String>>,
     pub churn_score: f64,
     pub normalized: Option<NormalizedMetrics>,
@@ -143,6 +152,20 @@ pub struct SummaryStats {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectStats {
     pub total_unique_authors: usize,
+    pub bus_factor: usize,
+    pub tech_debt_density: f64,
+    pub top_hotspots: Vec<Hotspot>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Hotspot {
+    pub id: String,
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub risk_score: f64,
+    pub churn_score: f64,
+    pub cognitive_complexity: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

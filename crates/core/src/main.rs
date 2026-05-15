@@ -1,5 +1,5 @@
 use anyhow::Result;
-use churnlens::analyze_repository;
+use churnlens::analyze_repository_with_authors;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,7 +52,13 @@ fn main() -> Result<()> {
         r.store(true, Ordering::SeqCst);
     })?;
 
-    let report = analyze_repository(&args.path, &args.sort, args.limit, args.include_authors, shutdown)?;
+    let report = analyze_repository_with_authors(
+        &args.path,
+        &args.sort,
+        args.limit,
+        args.include_authors,
+        shutdown,
+    )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
 
     Ok(())

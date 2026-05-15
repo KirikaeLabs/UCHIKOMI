@@ -1,7 +1,7 @@
-use crate::cache::{GitCacheEntry, GitCacheMetadata, GIT_ALGORITHM_VERSION};
+use crate::cache::{GitCacheEntry, GitCacheMetadata, LineChange, GIT_ALGORITHM_VERSION};
 use crate::metrics::ChurnMetrics;
 use anyhow::{anyhow, Result};
-use git2::{Commit, Delta, DiffFindOptions, DiffOptions, Oid, Repository};
+use git2::{Commit, Delta, DiffDelta, DiffFindOptions, DiffHunk, DiffOptions, Oid, Repository};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -11,6 +11,7 @@ pub struct GitAnalyzer;
 
 const COMMITS_PER_WORKER_CHUNK: usize = 32;
 const COMMITS_PER_BATCH: usize = 4096;
+const FULL_FILE_RANGE_END_LINE: u32 = 1_000_000_000;
 
 thread_local! {
      static REPO_HANDLE: RefCell<Option<ThreadLocalRepository>> = const { RefCell::new(None) };
@@ -41,8 +42,14 @@ struct GitBatchMetrics {
 }
 
 struct ModifiedFiles {
-    paths: HashSet<String>,
+    files: HashMap<String, Vec<ChangedRange>>,
     renames: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct ChangedRange {
+    start_line: u32,
+    end_line: u32,
 }
 
 impl GitAnalyzer {
@@ -161,6 +168,52 @@ impl GitAnalyzer {
         }
     }
 
+    pub fn compute_churn_metrics_for_range(
+        cache_entry: &GitCacheEntry,
+        start_line: u32,
+        end_line: u32,
+    ) -> ChurnMetrics {
+        if cache_entry.line_changes.is_empty() {
+            return Self::compute_churn_metrics(cache_entry);
+        }
+
+        let mut commits = HashSet::new();
+        let mut bug_fix_commits = HashSet::new();
+        let mut authors = HashSet::new();
+
+        for change in &cache_entry.line_changes {
+            if ranges_overlap(start_line, end_line, change.start_line, change.end_line) {
+                commits.insert(change.commit.clone());
+                if change.is_bug_fix {
+                    bug_fix_commits.insert(change.commit.clone());
+                }
+                authors.insert(change.author.clone());
+            }
+        }
+
+        if commits.is_empty() {
+            return ChurnMetrics {
+                times_modified: 0,
+                bug_fix_commits: 0,
+                authors_count: 0,
+                authors: Vec::new(),
+                churn_score: 0.0,
+            };
+        }
+
+        let authors_count = authors.len().max(1);
+        let churn_score = (commits.len() as f64 + (bug_fix_commits.len() as f64 * 2.0))
+            * (authors_count as f64 + 1.0).log10();
+
+        ChurnMetrics {
+            times_modified: commits.len(),
+            bug_fix_commits: bug_fix_commits.len(),
+            authors_count,
+            authors: authors.into_iter().collect(),
+            churn_score,
+        }
+    }
+
     fn is_git_cache_compatible(
         metadata: Option<&GitCacheMetadata>,
         repository_path: &Path,
@@ -177,7 +230,7 @@ impl GitAnalyzer {
     }
 
     fn get_modified_files_optimized(repo: &Repository, commit: &Commit) -> Result<ModifiedFiles> {
-        let mut files = HashSet::new();
+        let mut files = HashMap::new();
         let mut renames = Vec::new();
         let current_tree = commit.tree()?;
 
@@ -198,24 +251,27 @@ impl GitAnalyzer {
                 if let Some(name) = entry.name() {
                     let path = Path::new(root).join(name);
                     if let Some(path_str) = path.to_str() {
-                        files.insert(path_str.to_string());
+                        files.insert(
+                            path_str.to_string(),
+                            vec![ChangedRange {
+                                start_line: 1,
+                                end_line: FULL_FILE_RANGE_END_LINE,
+                            }],
+                        );
                     }
                 }
                 git2::TreeWalkResult::Ok
             })?;
         }
 
-        Ok(ModifiedFiles {
-            paths: files,
-            renames,
-        })
+        Ok(ModifiedFiles { files, renames })
     }
 
     fn collect_diff_paths(
         repo: &Repository,
         old_tree: Option<&git2::Tree>,
         new_tree: Option<&git2::Tree>,
-        files: &mut HashSet<String>,
+        files: &mut HashMap<String, Vec<ChangedRange>>,
         renames: &mut Vec<(String, String)>,
     ) -> Result<()> {
         let mut opts = DiffOptions::new();
@@ -227,30 +283,50 @@ impl GitAnalyzer {
         find_opts.renames(true);
         diff.find_similar(Some(&mut find_opts))?;
 
-        for delta in diff.deltas() {
-            let new_path = delta
-                .new_file()
-                .path()
-                .and_then(|path| path.to_str())
-                .map(str::to_string);
+        let collected_files = RefCell::new(HashMap::<String, Vec<ChangedRange>>::new());
+        let collected_renames = RefCell::new(Vec::<(String, String)>::new());
+        diff.foreach(
+            &mut |delta, _| {
+                let new_path = delta
+                    .new_file()
+                    .path()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_string);
 
-            if delta.status() == Delta::Renamed {
-                if let (Some(old_path), Some(new_path)) = (
-                    delta
-                        .old_file()
-                        .path()
-                        .and_then(|path| path.to_str())
-                        .map(str::to_string),
-                    new_path.clone(),
-                ) {
-                    renames.push((old_path, new_path));
+                if delta.status() == Delta::Renamed {
+                    if let (Some(old_path), Some(new_path)) = (
+                        delta
+                            .old_file()
+                            .path()
+                            .and_then(|path| path.to_str())
+                            .map(str::to_string),
+                        new_path.clone(),
+                    ) {
+                        collected_renames.borrow_mut().push((old_path, new_path));
+                    }
                 }
-            }
 
-            if let Some(path) = new_path {
-                files.insert(path);
-            }
-        }
+                if let Some(path) = new_path {
+                    collected_files.borrow_mut().entry(path).or_default();
+                }
+                true
+            },
+            None,
+            Some(&mut |delta, hunk| {
+                let Some(path) = hunk_path(delta) else {
+                    return true;
+                };
+                collected_files
+                    .borrow_mut()
+                    .entry(path)
+                    .or_default()
+                    .push(changed_range_from_hunk(hunk));
+                true
+            }),
+            None,
+        )?;
+        files.extend(collected_files.into_inner());
+        renames.extend(collected_renames.into_inner());
 
         Ok(())
     }
@@ -303,13 +379,29 @@ impl GitAnalyzer {
         let modified_files = Self::get_modified_files_optimized(repo, &commit)?;
 
         let mut metrics = HashMap::new();
-        for file_path in modified_files.paths {
+        let commit_id = oid.to_string();
+        for (file_path, mut ranges) in modified_files.files {
             let entry: &mut GitCacheEntry = metrics.entry(file_path).or_default();
             entry.times_modified += 1;
             if is_bug_fix {
                 entry.bug_fix_commits += 1;
             }
             entry.authors.insert(author.clone());
+            if ranges.is_empty() {
+                ranges.push(ChangedRange {
+                    start_line: 1,
+                    end_line: FULL_FILE_RANGE_END_LINE,
+                });
+            }
+            for range in ranges {
+                entry.line_changes.push(LineChange {
+                    commit: commit_id.clone(),
+                    start_line: range.start_line,
+                    end_line: range.end_line,
+                    is_bug_fix,
+                    author: author.clone(),
+                });
+            }
         }
 
         Ok(GitBatchMetrics {
@@ -336,6 +428,7 @@ impl GitAnalyzer {
             target_entry.times_modified += source_entry.times_modified;
             target_entry.bug_fix_commits += source_entry.bug_fix_commits;
             target_entry.authors.extend(source_entry.authors);
+            target_entry.line_changes.extend(source_entry.line_changes);
         }
     }
 
@@ -359,6 +452,7 @@ impl GitAnalyzer {
             target_entry.times_modified += entry.times_modified;
             target_entry.bug_fix_commits += entry.bug_fix_commits;
             target_entry.authors.extend(entry.authors);
+            target_entry.line_changes.extend(entry.line_changes);
         }
     }
 
@@ -458,4 +552,26 @@ impl GitAnalyzer {
             false
         }
     }
+}
+
+fn hunk_path(delta: DiffDelta) -> Option<String> {
+    delta
+        .new_file()
+        .path()
+        .or_else(|| delta.old_file().path())
+        .and_then(|path| path.to_str())
+        .map(str::to_string)
+}
+
+fn changed_range_from_hunk(hunk: DiffHunk) -> ChangedRange {
+    let start_line = hunk.new_start().max(1);
+    let line_count = hunk.new_lines().max(1);
+    ChangedRange {
+        start_line,
+        end_line: start_line.saturating_add(line_count).saturating_sub(1),
+    }
+}
+
+fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> bool {
+    left_start <= right_end && right_start <= left_end
 }

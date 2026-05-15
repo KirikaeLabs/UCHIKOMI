@@ -1,6 +1,6 @@
+use super::LanguageSupport;
 use tree_sitter::{Language, Node};
 use tree_sitter_typescript::{language_tsx, language_typescript};
-use super::LanguageSupport;
 
 pub struct TypeScriptSupport {
     is_tsx: bool,

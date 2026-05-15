@@ -29,7 +29,7 @@ use std::sync::{
     Arc,
 };
 
-const SCHEMA_VERSION: &str = "0.2.0";
+const SCHEMA_VERSION: &str = "0.3.0";
 const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
 
 const WEIGHT_COGNITIVE: f64 = 0.35;
@@ -99,6 +99,15 @@ pub fn analyze_repository(
     repo_path: &Path,
     sort_by: &str,
     limit: Option<usize>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<Report> {
+    analyze_repository_with_authors(repo_path, sort_by, limit, false, shutdown)
+}
+
+pub fn analyze_repository_with_authors(
+    repo_path: &Path,
+    sort_by: &str,
+    limit: Option<usize>,
     include_authors: bool,
     shutdown: Arc<AtomicBool>,
 ) -> Result<Report> {
@@ -159,7 +168,8 @@ pub fn analyze_repository(
             high: THRESHOLD_HIGH,
             medium: THRESHOLD_MEDIUM,
         },
-        description: "Composite risk score based on complexity, churn, and team metrics.".to_string(),
+        description: "Composite risk score based on complexity, churn, and team metrics."
+            .to_string(),
     };
 
     if functions.is_empty() {
@@ -187,9 +197,7 @@ pub fn analyze_repository(
             scoring_policy,
             summary: SummaryStats {
                 total_functions: 0,
-                project_stats: metrics::ProjectStats {
-                    total_unique_authors,
-                },
+                project_stats: build_project_stats(&functions, &git_cache, total_unique_authors),
                 max_values: None,
                 distributions: None,
             },
@@ -200,6 +208,7 @@ pub fn analyze_repository(
 
     let scoring_context = compute_scoring_context(&functions);
     let distributions = apply_scoring_and_labels(&mut functions, &scoring_context);
+    let project_stats = build_project_stats(&functions, &git_cache, total_unique_authors);
 
     sort_functions(&mut functions, sort_by, &mut warnings);
     if let Some(limit) = limit {
@@ -236,9 +245,7 @@ pub fn analyze_repository(
         scoring_policy,
         summary: SummaryStats {
             total_functions: functions.len(),
-            project_stats: metrics::ProjectStats {
-                total_unique_authors,
-            },
+            project_stats,
             max_values: Some(scoring_context.max_values),
             distributions: Some(distributions),
         },
@@ -383,6 +390,89 @@ fn risk_score(function: &FunctionMetrics) -> f64 {
         .as_ref()
         .map(|risk| risk.final_score)
         .unwrap_or(0.0)
+}
+
+fn build_project_stats(
+    functions: &[FunctionMetrics],
+    git_cache: &HashMap<String, GitCacheEntry>,
+    total_unique_authors: usize,
+) -> metrics::ProjectStats {
+    let mut author_contributions: HashMap<String, usize> = HashMap::new();
+    for entry in git_cache.values() {
+        if entry.line_changes.is_empty() {
+            for author in &entry.authors {
+                *author_contributions.entry(author.clone()).or_default() += entry.times_modified;
+            }
+        } else {
+            for change in &entry.line_changes {
+                *author_contributions
+                    .entry(change.author.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    let total_contributions = author_contributions.values().sum::<usize>();
+    let bus_factor = if total_contributions == 0 {
+        0
+    } else {
+        let mut counts = author_contributions.into_values().collect::<Vec<_>>();
+        counts.sort_by(|a, b| b.cmp(a));
+        let majority = total_contributions.div_ceil(2);
+        let mut accumulated = 0usize;
+        let mut authors = 0usize;
+        for count in counts {
+            accumulated += count;
+            authors += 1;
+            if accumulated >= majority {
+                break;
+            }
+        }
+        authors
+    };
+
+    let total_loc = functions
+        .iter()
+        .map(|function| function.lines_of_code)
+        .sum::<u32>();
+    let total_complexity = functions
+        .iter()
+        .map(|function| function.cognitive_complexity + function.cyclomatic_complexity)
+        .sum::<u32>();
+    let tech_debt_density = if total_loc == 0 {
+        0.0
+    } else {
+        total_complexity as f64 / total_loc as f64
+    };
+
+    let mut hotspots = functions
+        .iter()
+        .map(|function| metrics::Hotspot {
+            id: function.id.clone(),
+            name: function.name.clone(),
+            file: function.file.clone(),
+            line: function.line,
+            risk_score: risk_score(function),
+            churn_score: function.churn_score,
+            cognitive_complexity: function.cognitive_complexity,
+        })
+        .collect::<Vec<_>>();
+    hotspots.sort_by(|a, b| {
+        b.risk_score
+            .total_cmp(&a.risk_score)
+            .then_with(|| b.churn_score.total_cmp(&a.churn_score))
+            .then_with(|| b.cognitive_complexity.cmp(&a.cognitive_complexity))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    hotspots.truncate(5);
+
+    metrics::ProjectStats {
+        total_unique_authors,
+        bus_factor,
+        tech_debt_density,
+        top_hotspots: hotspots,
+    }
 }
 
 fn build_quality(
@@ -648,7 +738,11 @@ fn analyze_files_parallel(
                     return Some(WorkerOutput {
                         warnings: vec![AnalysisWarning {
                             code: "path_error".to_string(),
-                            message: format!("Failed to strip prefix for {}: {}", path.display(), err),
+                            message: format!(
+                                "Failed to strip prefix for {}: {}",
+                                path.display(),
+                                err
+                            ),
                         }],
                         ..WorkerOutput::default()
                     });
@@ -684,8 +778,11 @@ fn analyze_files_parallel(
                     cached_entry.functions.clone()
                 } else {
                     output.cache_miss = 1;
-                    match AnalysisWorker::process_file_from_source(&source, &rel_path_str, &registry)
-                    {
+                    match AnalysisWorker::process_file_from_source(
+                        &source,
+                        &rel_path_str,
+                        &registry,
+                    ) {
                         Ok(functions) => functions,
                         Err(err) => {
                             output.skipped_files.push(SkippedFile {
@@ -711,8 +808,12 @@ fn analyze_files_parallel(
             };
 
             if let Some(entry) = git_cache.get(&rel_path_str) {
-                let churn = GitAnalyzer::compute_churn_metrics(entry);
                 for func in &mut functions {
+                    let churn = GitAnalyzer::compute_churn_metrics_for_range(
+                        entry,
+                        func.line,
+                        func.end_line,
+                    );
                     func.times_modified = churn.times_modified;
                     func.bug_fix_commits = churn.bug_fix_commits;
                     func.authors_count = churn.authors_count;

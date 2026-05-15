@@ -1,5 +1,5 @@
-use tree_sitter::{Language, Node};
 use super::LanguageSupport;
+use tree_sitter::{Language, Node};
 
 pub struct RustSupport;
 

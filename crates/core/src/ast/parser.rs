@@ -1,7 +1,7 @@
+use super::engine::ComplexityEngine;
+use super::LanguageSupport;
 use crate::metrics::FunctionMetrics;
 use tree_sitter::Parser;
-use super::LanguageSupport;
-use super::engine::ComplexityEngine;
 
 pub struct AstParser;
 
