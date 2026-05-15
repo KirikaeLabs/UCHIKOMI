@@ -7,7 +7,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC: &[u8; 4] = b"CHRN";
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 pub const GIT_ALGORITHM_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Default)]

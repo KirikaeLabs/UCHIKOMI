@@ -13,6 +13,8 @@ pub struct FunctionMetrics {
     pub times_modified: usize,
     pub bug_fix_commits: usize,
     pub authors_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authors: Option<Vec<String>>,
     pub churn_score: f64,
     pub normalized: Option<NormalizedMetrics>,
     pub risk: Option<RiskMetrics>,
@@ -48,9 +50,33 @@ pub struct PercentileMetrics {
 pub struct Report {
     pub schema_version: String,
     pub analysis: AnalysisMetadata,
+    pub scoring_policy: ScoringPolicy,
     pub summary: SummaryStats,
     pub quality: AnalysisQuality,
     pub functions: Vec<FunctionMetrics>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScoringPolicy {
+    pub weights: Weights,
+    pub thresholds: Thresholds,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Weights {
+    pub cognitive: f64,
+    pub cyclomatic: f64,
+    pub churn: f64,
+    pub loc: f64,
+    pub authors: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Thresholds {
+    pub critical: f64,
+    pub high: f64,
+    pub medium: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,8 +135,14 @@ pub struct SkippedFile {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SummaryStats {
     pub total_functions: usize,
+    pub project_stats: ProjectStats,
     pub max_values: Option<MaxValues>,
     pub distributions: Option<Distributions>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectStats {
+    pub total_unique_authors: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,5 +165,6 @@ pub struct ChurnMetrics {
     pub times_modified: usize,
     pub bug_fix_commits: usize,
     pub authors_count: usize,
+    pub authors: Vec<String>,
     pub churn_score: f64,
 }

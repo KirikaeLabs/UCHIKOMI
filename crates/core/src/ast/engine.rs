@@ -148,6 +148,7 @@ impl<'a> ComplexityEngine<'a> {
             times_modified: 0,
             bug_fix_commits: 0,
             authors_count: 0,
+            authors: None,
             churn_score: 0.0,
             normalized: None,
             risk: None,

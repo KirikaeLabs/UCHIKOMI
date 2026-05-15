@@ -156,6 +156,7 @@ impl GitAnalyzer {
             times_modified: cache_entry.times_modified,
             bug_fix_commits: cache_entry.bug_fix_commits,
             authors_count,
+            authors: cache_entry.authors.iter().cloned().collect(),
             churn_score,
         }
     }

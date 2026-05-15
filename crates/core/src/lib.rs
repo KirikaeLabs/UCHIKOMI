@@ -18,7 +18,7 @@ use ignore::WalkBuilder;
 use metrics::{
     AnalysisMetadata, AnalysisQuality, AnalysisStatus, AnalysisWarning, CacheAnalysisStatus,
     Distributions, FunctionMetrics, GitAnalysisStatus, MaxValues, NormalizedMetrics,
-    PercentileMetrics, Report, RiskMetrics, SkippedFile, SummaryStats,
+    PercentileMetrics, Report, RiskMetrics, ScoringPolicy, SkippedFile, SummaryStats,
 };
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::cmp::Ordering as CmpOrdering;
@@ -31,6 +31,16 @@ use std::sync::{
 
 const SCHEMA_VERSION: &str = "0.2.0";
 const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
+
+const WEIGHT_COGNITIVE: f64 = 0.35;
+const WEIGHT_CYCLOMATIC: f64 = 0.15;
+const WEIGHT_CHURN: f64 = 0.30;
+const WEIGHT_LOC: f64 = 0.10;
+const WEIGHT_AUTHORS: f64 = 0.10;
+
+const THRESHOLD_CRITICAL: f64 = 95.0;
+const THRESHOLD_HIGH: f64 = 80.0;
+const THRESHOLD_MEDIUM: f64 = 50.0;
 
 struct RepoContext {
     repo: Option<Repository>,
@@ -89,6 +99,7 @@ pub fn analyze_repository(
     repo_path: &Path,
     sort_by: &str,
     limit: Option<usize>,
+    include_authors: bool,
     shutdown: Arc<AtomicBool>,
 ) -> Result<Report> {
     log::info!("Analyzing repository: {}", repo_path.display());
@@ -107,11 +118,18 @@ pub fn analyze_repository(
         &mut warnings,
     );
 
+    let total_unique_authors = git_cache
+        .values()
+        .flat_map(|entry| entry.authors.iter())
+        .collect::<HashSet<_>>()
+        .len();
+
     let worker_result = analyze_files_parallel(
         &ctx.repo_path_abs,
         registry,
         &ctx.cache,
         &git_cache,
+        include_authors,
         shutdown,
     );
 
@@ -127,6 +145,22 @@ pub fn analyze_repository(
     warnings.extend(worker_warnings);
     skipped_files.extend(worker_skipped);
     git_cache.retain(|path, _| active_paths.contains(path));
+
+    let scoring_policy = ScoringPolicy {
+        weights: metrics::Weights {
+            cognitive: WEIGHT_COGNITIVE,
+            cyclomatic: WEIGHT_CYCLOMATIC,
+            churn: WEIGHT_CHURN,
+            loc: WEIGHT_LOC,
+            authors: WEIGHT_AUTHORS,
+        },
+        thresholds: metrics::Thresholds {
+            critical: THRESHOLD_CRITICAL,
+            high: THRESHOLD_HIGH,
+            medium: THRESHOLD_MEDIUM,
+        },
+        description: "Composite risk score based on complexity, churn, and team metrics.".to_string(),
+    };
 
     if functions.is_empty() {
         warnings.push(AnalysisWarning {
@@ -150,8 +184,12 @@ pub fn analyze_repository(
                 branch: ctx.branch,
                 timestamp: ctx.timestamp,
             },
+            scoring_policy,
             summary: SummaryStats {
                 total_functions: 0,
+                project_stats: metrics::ProjectStats {
+                    total_unique_authors,
+                },
                 max_values: None,
                 distributions: None,
             },
@@ -195,8 +233,12 @@ pub fn analyze_repository(
             branch: ctx.branch,
             timestamp: ctx.timestamp,
         },
+        scoring_policy,
         summary: SummaryStats {
             total_functions: functions.len(),
+            project_stats: metrics::ProjectStats {
+                total_unique_authors,
+            },
             max_values: Some(scoring_context.max_values),
             distributions: Some(distributions),
         },
@@ -567,6 +609,7 @@ fn analyze_files_parallel(
     registry: Arc<LanguageRegistry>,
     cache: &AnalysisCache,
     git_cache: &HashMap<String, GitCacheEntry>,
+    include_authors: bool,
     shutdown: Arc<AtomicBool>,
 ) -> WorkerResult {
     let walker = WalkBuilder::new(repo_path_abs)
@@ -673,6 +716,11 @@ fn analyze_files_parallel(
                     func.times_modified = churn.times_modified;
                     func.bug_fix_commits = churn.bug_fix_commits;
                     func.authors_count = churn.authors_count;
+                    func.authors = if include_authors {
+                        Some(churn.authors.clone())
+                    } else {
+                        None
+                    };
                     func.churn_score = churn.churn_score;
                     func.file = rel_path_str.clone();
                 }
@@ -825,11 +873,11 @@ fn apply_scoring_and_labels(
             authors: norm_auth,
         });
 
-        let base_score = (0.35 * norm_cog)
-            + (0.15 * norm_cyc)
-            + (0.30 * norm_churn)
-            + (0.10 * norm_loc)
-            + (0.10 * norm_auth);
+        let base_score = (WEIGHT_COGNITIVE * norm_cog)
+            + (WEIGHT_CYCLOMATIC * norm_cyc)
+            + (WEIGHT_CHURN * norm_churn)
+            + (WEIGHT_LOC * norm_loc)
+            + (WEIGHT_AUTHORS * norm_auth);
         let nesting_penalty = 1.0 + (func.nesting_depth as f64 / 4.0).powi(2) * 0.20;
         let final_score = base_score * nesting_penalty;
 
@@ -865,9 +913,9 @@ fn apply_scoring_and_labels(
         });
 
         let level = match risk_pct {
-            p if p >= 95.0 => "critical",
-            p if p >= 80.0 => "high",
-            p if p >= 50.0 => "medium",
+            p if p >= THRESHOLD_CRITICAL => "critical",
+            p if p >= THRESHOLD_HIGH => "high",
+            p if p >= THRESHOLD_MEDIUM => "medium",
             _ => "low",
         }
         .to_string();
