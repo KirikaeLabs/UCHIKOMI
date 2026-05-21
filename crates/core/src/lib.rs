@@ -1466,9 +1466,9 @@ fn apply_scoring_and_labels(
         let coverage_gap = func
             .coverage
             .as_ref()
-            .map(|coverage| coverage.risk_coverage_gap)
-            .unwrap_or(0.0);
-        let norm_coverage_gap = normalized_value(coverage_gap, context.caps.coverage_gap);
+            .map(|coverage| coverage.risk_coverage_gap);
+        let norm_coverage_gap =
+            coverage_gap.map(|gap| normalized_value(gap, context.caps.coverage_gap));
 
         func.normalized = Some(NormalizedMetrics {
             cyclomatic: norm_cyc,
@@ -1488,7 +1488,7 @@ fn apply_scoring_and_labels(
             + (WEIGHT_FAN_IN * norm_fan_in)
             + (WEIGHT_LOC * norm_loc)
             + (WEIGHT_AUTHORS * norm_auth)
-            + (WEIGHT_COVERAGE_GAP * norm_coverage_gap);
+            + (WEIGHT_COVERAGE_GAP * norm_coverage_gap.unwrap_or(0.0));
         let nesting_penalty = 1.0 + (func.nesting_depth as f64 / 4.0).powi(2) * 0.20;
         let fan_in_multiplier = 1.0 + norm_fan_in * 0.25;
         let final_score = base_score * nesting_penalty * fan_in_multiplier;
@@ -1534,14 +1534,17 @@ fn apply_scoring_and_labels(
 
         if let Some(norm) = &func.normalized {
             let mut drivers = [
-                ("cognitive", norm.cognitive),
-                ("churn", norm.churn),
-                ("churn_recent", norm.churn_recent),
-                ("fan_in", norm.fan_in),
-                ("cyclomatic", norm.cyclomatic),
-                ("loc", norm.loc),
-                ("authors", norm.authors),
-                ("coverage_gap", norm.coverage_gap),
+                ("cognitive", norm.cognitive * WEIGHT_COGNITIVE),
+                ("churn", norm.churn * WEIGHT_CHURN),
+                ("churn_recent", norm.churn_recent * WEIGHT_CHURN_RECENT),
+                ("fan_in", norm.fan_in * WEIGHT_FAN_IN),
+                ("cyclomatic", norm.cyclomatic * WEIGHT_CYCLOMATIC),
+                ("loc", norm.loc * WEIGHT_LOC),
+                ("authors", norm.authors * WEIGHT_AUTHORS),
+                (
+                    "coverage_gap",
+                    norm.coverage_gap.unwrap_or(0.0) * WEIGHT_COVERAGE_GAP,
+                ),
             ];
             drivers.sort_by(|a, b| b.1.total_cmp(&a.1));
             if let Some(risk) = func.risk.as_mut() {

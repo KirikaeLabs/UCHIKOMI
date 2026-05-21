@@ -697,6 +697,10 @@ fn churn_window(
 }
 
 fn churn_velocity(windows: &ChurnWindows) -> String {
+    if windows.d90.modifications <= 1 {
+        return "stable".to_string();
+    }
+
     let d7_rate = windows.d7.modifications as f64 / 7.0;
     let d90_rate = windows.d90.modifications as f64 / 90.0;
 

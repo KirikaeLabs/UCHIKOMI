@@ -43,7 +43,7 @@ pub struct NormalizedMetrics {
     pub fan_in: f64,
     pub loc: f64,
     pub authors: f64,
-    pub coverage_gap: f64,
+    pub coverage_gap: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
