@@ -71,7 +71,48 @@ impl GitAnalyzer {
         head_oid: &str,
         bug_fix_patterns: &BugFixPatterns,
     ) -> Result<GitMetricsResult> {
-        let mut result = GitMetricsResult {
+        let mut result =
+            Self::initial_git_metrics_result(repository_path, branch, head_oid, bug_fix_patterns);
+
+        let mut last_commit_oid = last_commit_oid;
+        Self::reset_incompatible_git_cache(
+            &mut git_cache,
+            &mut last_commit_oid,
+            git_metadata.as_ref(),
+            repository_path,
+            branch,
+            bug_fix_patterns,
+            &mut result,
+        );
+
+        let mut revwalk = repo.revwalk()?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+        revwalk.push_head()?;
+
+        if Self::prepare_incremental_revwalk(
+            repo,
+            &mut revwalk,
+            &mut git_cache,
+            last_commit_oid.as_deref(),
+            head_oid,
+            &mut result,
+        )? {
+            result.cache = git_cache;
+            return Ok(result);
+        }
+
+        let new_metrics = Self::collect_batch_metrics(repo.path(), revwalk, bug_fix_patterns)?;
+        Self::apply_batch_metrics_to_result(&mut result, &mut git_cache, new_metrics);
+        Ok(result)
+    }
+
+    fn initial_git_metrics_result(
+        repository_path: &Path,
+        branch: &str,
+        head_oid: &str,
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> GitMetricsResult {
+        GitMetricsResult {
             cache: HashMap::new(),
             metadata: GitCacheMetadata {
                 repository_path: repository_path.to_string_lossy().to_string(),
@@ -84,62 +125,79 @@ impl GitAnalyzer {
             processed_commits: 0,
             partial: false,
             warnings: Vec::new(),
-        };
+        }
+    }
 
-        let mut last_commit_oid = last_commit_oid;
-        if !Self::is_git_cache_compatible(
-            git_metadata.as_ref(),
-            repository_path,
-            branch,
-            bug_fix_patterns,
-        ) {
+    fn reset_incompatible_git_cache(
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        last_commit_oid: &mut Option<String>,
+        git_metadata: Option<&GitCacheMetadata>,
+        repository_path: &Path,
+        branch: &str,
+        bug_fix_patterns: &BugFixPatterns,
+        result: &mut GitMetricsResult,
+    ) {
+        if !Self::is_git_cache_compatible(git_metadata, repository_path, branch, bug_fix_patterns) {
             git_cache.clear();
-            last_commit_oid = None;
+            *last_commit_oid = None;
             result.cache_reset = true;
         }
         if last_commit_oid.is_none() && !git_cache.is_empty() {
             git_cache.clear();
             result.cache_reset = true;
         }
+    }
 
-        let mut revwalk = repo.revwalk()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-        revwalk.push_head()?;
+    fn prepare_incremental_revwalk(
+        repo: &Repository,
+        revwalk: &mut git2::Revwalk<'_>,
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        last_commit_oid: Option<&str>,
+        head_oid: &str,
+        result: &mut GitMetricsResult,
+    ) -> Result<bool> {
+        let Some(oid_str) = last_commit_oid else {
+            return Ok(false);
+        };
 
-        if let Some(oid_str) = last_commit_oid.as_deref() {
-            let head = Oid::from_str(head_oid)?;
-            match Oid::from_str(oid_str) {
-                Ok(oid) if oid == head => {
-                    result.cache = git_cache;
-                    return Ok(result);
-                }
-                Ok(oid) if repo.graph_descendant_of(head, oid).unwrap_or(false) => {
-                    if let Err(err) = revwalk.hide(oid) {
-                        git_cache.clear();
-                        result.cache_reset = true;
-                        result.warnings.push(format!(
-                            "Failed to hide cached Git commit {oid}: {err}. Git cache was rebuilt."
-                        ));
-                    }
-                }
-                Ok(oid) => {
+        let head = Oid::from_str(head_oid)?;
+        match Oid::from_str(oid_str) {
+            Ok(oid) if oid == head => Ok(true),
+            Ok(oid) if repo.graph_descendant_of(head, oid).unwrap_or(false) => {
+                if let Err(err) = revwalk.hide(oid) {
                     git_cache.clear();
                     result.cache_reset = true;
                     result.warnings.push(format!(
-                        "Cached Git commit {oid} is not an ancestor of HEAD. Git cache was rebuilt."
+                        "Failed to hide cached Git commit {oid}: {err}. Git cache was rebuilt."
                     ));
                 }
-                Err(err) => {
-                    git_cache.clear();
-                    result.cache_reset = true;
-                    result.warnings.push(format!(
-                        "Cached Git commit '{oid_str}' is invalid: {err}. Git cache was rebuilt."
-                    ));
-                }
+                Ok(false)
+            }
+            Ok(oid) => {
+                git_cache.clear();
+                result.cache_reset = true;
+                result.warnings.push(format!(
+                    "Cached Git commit {oid} is not an ancestor of HEAD. Git cache was rebuilt."
+                ));
+                Ok(false)
+            }
+            Err(err) => {
+                git_cache.clear();
+                result.cache_reset = true;
+                result.warnings.push(format!(
+                    "Cached Git commit '{oid_str}' is invalid: {err}. Git cache was rebuilt."
+                ));
+                Ok(false)
             }
         }
+    }
 
-        let repo_path = repo.path().to_path_buf();
+    fn collect_batch_metrics(
+        repo_path: &Path,
+        revwalk: git2::Revwalk<'_>,
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> Result<GitBatchMetrics> {
+        let repo_path = repo_path.to_path_buf();
         let mut pending = Vec::with_capacity(COMMITS_PER_BATCH);
         let mut new_metrics = GitBatchMetrics::default();
 
@@ -158,15 +216,20 @@ impl GitAnalyzer {
             Self::merge_batch_metrics(&mut new_metrics, batch_metrics);
         }
 
+        Ok(new_metrics)
+    }
+
+    fn apply_batch_metrics_to_result(
+        result: &mut GitMetricsResult,
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        new_metrics: GitBatchMetrics,
+    ) {
         result.processed_commits = new_metrics.processed_commits;
         result.partial = new_metrics.partial;
         result.warnings.extend(new_metrics.warnings);
-
-        Self::merge_git_cache(&mut git_cache, new_metrics.files);
-        Self::apply_rename_aliases(&mut git_cache, &new_metrics.renames);
-        result.cache = git_cache;
-
-        Ok(result)
+        Self::merge_git_cache(git_cache, new_metrics.files);
+        Self::apply_rename_aliases(git_cache, &new_metrics.renames);
+        result.cache = std::mem::take(git_cache);
     }
 
     pub fn compute_churn_metrics(cache_entry: &GitCacheEntry) -> ChurnMetrics {

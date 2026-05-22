@@ -161,16 +161,7 @@ pub fn analyze_repository_with_authors(
     let mut skipped_files = Vec::new();
 
     let mut ctx = load_repository_context(repo_path, &mut warnings)?;
-    let bug_fix_patterns = match BugFixPatterns::from_patterns(&ctx.config.git.bug_fix_patterns) {
-        Ok(patterns) => patterns,
-        Err(err) => {
-            warnings.push(AnalysisWarning {
-                code: "invalid_bug_fix_pattern".to_string(),
-                message: format!("Invalid bug-fix pattern configuration: {err}"),
-            });
-            BugFixPatterns::default()
-        }
-    };
+    let bug_fix_patterns = configured_bug_fix_patterns(&ctx.config, &mut warnings);
     let (mut git_cache, git_status) = collect_git_analysis(
         ctx.repo.as_ref(),
         &ctx.repo_path_abs,
@@ -210,25 +201,7 @@ pub fn analyze_repository_with_authors(
     git_cache.retain(|path, _| active_paths.contains(path));
     apply_coverage(&mut functions, ctx.coverage.as_ref());
 
-    let scoring_policy = ScoringPolicy {
-        weights: metrics::Weights {
-            cognitive: WEIGHT_COGNITIVE,
-            cyclomatic: WEIGHT_CYCLOMATIC,
-            churn: WEIGHT_CHURN,
-            churn_recent: WEIGHT_CHURN_RECENT,
-            fan_in: WEIGHT_FAN_IN,
-            loc: WEIGHT_LOC,
-            authors: WEIGHT_AUTHORS,
-            coverage_gap: WEIGHT_COVERAGE_GAP,
-        },
-        thresholds: metrics::Thresholds {
-            critical: THRESHOLD_CRITICAL,
-            high: THRESHOLD_HIGH,
-            medium: THRESHOLD_MEDIUM,
-        },
-        description: "Composite risk score based on complexity, churn, and team metrics."
-            .to_string(),
-    };
+    let scoring_policy = default_scoring_policy();
 
     if functions.is_empty() {
         warnings.push(AnalysisWarning {
@@ -246,12 +219,12 @@ pub fn analyze_repository_with_authors(
         );
         return Ok(Report {
             schema_version: SCHEMA_VERSION.to_string(),
-            analysis: AnalysisMetadata {
-                repository: ctx.repo_path_abs.to_string_lossy().to_string(),
-                commit: ctx.commit_hash,
-                branch: ctx.branch,
-                timestamp: ctx.timestamp,
-            },
+            analysis: analysis_metadata(
+                &ctx.repo_path_abs,
+                &ctx.commit_hash,
+                &ctx.branch,
+                &ctx.timestamp,
+            ),
             scoring_policy,
             summary: SummaryStats {
                 total_functions: 0,
@@ -297,12 +270,12 @@ pub fn analyze_repository_with_authors(
 
     Ok(Report {
         schema_version: SCHEMA_VERSION.to_string(),
-        analysis: AnalysisMetadata {
-            repository: ctx.repo_path_abs.to_string_lossy().to_string(),
-            commit: ctx.commit_hash,
-            branch: ctx.branch,
-            timestamp: ctx.timestamp,
-        },
+        analysis: analysis_metadata(
+            &ctx.repo_path_abs,
+            &ctx.commit_hash,
+            &ctx.branch,
+            &ctx.timestamp,
+        ),
         scoring_policy,
         summary: SummaryStats {
             total_functions: functions.len(),
@@ -314,6 +287,58 @@ pub fn analyze_repository_with_authors(
         quality,
         functions,
     })
+}
+
+fn configured_bug_fix_patterns(
+    config: &ChurnLensConfig,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> BugFixPatterns {
+    match BugFixPatterns::from_patterns(&config.git.bug_fix_patterns) {
+        Ok(patterns) => patterns,
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "invalid_bug_fix_pattern".to_string(),
+                message: format!("Invalid bug-fix pattern configuration: {err}"),
+            });
+            BugFixPatterns::default()
+        }
+    }
+}
+
+fn default_scoring_policy() -> ScoringPolicy {
+    ScoringPolicy {
+        weights: metrics::Weights {
+            cognitive: WEIGHT_COGNITIVE,
+            cyclomatic: WEIGHT_CYCLOMATIC,
+            churn: WEIGHT_CHURN,
+            churn_recent: WEIGHT_CHURN_RECENT,
+            fan_in: WEIGHT_FAN_IN,
+            loc: WEIGHT_LOC,
+            authors: WEIGHT_AUTHORS,
+            coverage_gap: WEIGHT_COVERAGE_GAP,
+        },
+        thresholds: metrics::Thresholds {
+            critical: THRESHOLD_CRITICAL,
+            high: THRESHOLD_HIGH,
+            medium: THRESHOLD_MEDIUM,
+        },
+        description: "Composite risk score based on complexity, churn, and team metrics."
+            .to_string(),
+    }
+}
+
+fn analysis_metadata(
+    repo_path_abs: &Path,
+    commit_hash: &str,
+    branch: &str,
+    timestamp: &str,
+) -> AnalysisMetadata {
+    AnalysisMetadata {
+        repository: repo_path_abs.to_string_lossy().to_string(),
+        commit: commit_hash.to_string(),
+        branch: branch.to_string(),
+        timestamp: timestamp.to_string(),
+    }
 }
 
 fn repository_metadata(repo: &Repository) -> (String, String, String) {
@@ -889,56 +914,11 @@ fn load_repository_context(
     warnings: &mut Vec<AnalysisWarning>,
 ) -> Result<RepoContext> {
     let repo_path_abs = repo_path.canonicalize()?;
-    let repo = match Repository::open(&repo_path_abs) {
-        Ok(repo) => Some(repo),
-        Err(err) => {
-            warnings.push(AnalysisWarning {
-                code: "git_unavailable".to_string(),
-                message: format!("Git repository unavailable: {err}"),
-            });
-            None
-        }
-    };
-
-    let (branch, commit_hash, timestamp) = match repo.as_ref() {
-        Some(repo) => repository_metadata(repo),
-        None => (
-            "unknown".to_string(),
-            String::new(),
-            FALLBACK_TIMESTAMP.to_string(),
-        ),
-    };
-
-    let cache_manager = match CacheManager::new(&repo_path_abs) {
-        Ok(cm) => Some(cm),
-        Err(err) => {
-            warnings.push(AnalysisWarning {
-                code: "cache_unavailable".to_string(),
-                message: format!("Failed to initialize cache: {err}"),
-            });
-            None
-        }
-    };
-
-    let cache = if let Some(cm) = &cache_manager {
-        match cm.load() {
-            Ok(cache) => cache,
-            Err(err) => {
-                warnings.push(AnalysisWarning {
-                    code: "cache_load_failed".to_string(),
-                    message: format!("Failed to load cache: {err}"),
-                });
-                AnalysisCache::default()
-            }
-        }
-    } else {
-        AnalysisCache::default()
-    };
-
-    let cache_loaded = cache_manager.is_some()
-        && (!cache.files.is_empty()
-            || !cache.git_cache.is_empty()
-            || cache.last_commit_oid.is_some());
+    let repo = open_repository(&repo_path_abs, warnings);
+    let (branch, commit_hash, timestamp) = repository_context_metadata(repo.as_ref());
+    let cache_manager = initialize_cache_manager(&repo_path_abs, warnings);
+    let cache = load_analysis_cache(&cache_manager, warnings);
+    let cache_loaded = cache_manager.is_some() && analysis_cache_has_entries(&cache);
     let config = load_config(&repo_path_abs, warnings);
     let coverage = load_coverage_index(&repo_path_abs, warnings);
 
@@ -954,6 +934,72 @@ fn load_repository_context(
         config,
         coverage,
     })
+}
+
+fn open_repository(
+    repo_path_abs: &Path,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> Option<Repository> {
+    match Repository::open(repo_path_abs) {
+        Ok(repo) => Some(repo),
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "git_unavailable".to_string(),
+                message: format!("Git repository unavailable: {err}"),
+            });
+            None
+        }
+    }
+}
+
+fn repository_context_metadata(repo: Option<&Repository>) -> (String, String, String) {
+    match repo {
+        Some(repo) => repository_metadata(repo),
+        None => (
+            "unknown".to_string(),
+            String::new(),
+            FALLBACK_TIMESTAMP.to_string(),
+        ),
+    }
+}
+
+fn initialize_cache_manager(
+    repo_path_abs: &Path,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> Option<CacheManager> {
+    match CacheManager::new(repo_path_abs) {
+        Ok(cm) => Some(cm),
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "cache_unavailable".to_string(),
+                message: format!("Failed to initialize cache: {err}"),
+            });
+            None
+        }
+    }
+}
+
+fn load_analysis_cache(
+    cache_manager: &Option<CacheManager>,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> AnalysisCache {
+    match cache_manager {
+        Some(cm) => match cm.load() {
+            Ok(cache) => cache,
+            Err(err) => {
+                warnings.push(AnalysisWarning {
+                    code: "cache_load_failed".to_string(),
+                    message: format!("Failed to load cache: {err}"),
+                });
+                AnalysisCache::default()
+            }
+        },
+        None => AnalysisCache::default(),
+    }
+}
+
+fn analysis_cache_has_entries(cache: &AnalysisCache) -> bool {
+    !cache.files.is_empty() || !cache.git_cache.is_empty() || cache.last_commit_oid.is_some()
 }
 
 fn load_config(repo_path: &Path, warnings: &mut Vec<AnalysisWarning>) -> ChurnLensConfig {
@@ -1156,140 +1202,16 @@ fn analyze_files_parallel(
     walker
         .par_bridge()
         .filter_map(|entry| {
-            if shutdown.load(Ordering::Relaxed) {
-                return None;
-            }
-
-            let entry = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    return Some(WorkerOutput {
-                        warnings: vec![AnalysisWarning {
-                            code: "walk_entry_failed".to_string(),
-                            message: format!("Failed to read directory entry: {err}"),
-                        }],
-                        ..WorkerOutput::default()
-                    });
-                }
-            };
-
-            let path = entry.path();
-            if !path.is_file() {
-                return None;
-            }
-
-            let rel_path = match path.strip_prefix(repo_path_abs) {
-                Ok(p) => p,
-                Err(err) => {
-                    return Some(WorkerOutput {
-                        warnings: vec![AnalysisWarning {
-                            code: "path_error".to_string(),
-                            message: format!(
-                                "Failed to strip prefix for {}: {}",
-                                path.display(),
-                                err
-                            ),
-                        }],
-                        ..WorkerOutput::default()
-                    });
-                }
-            };
-            let rel_path_str = rel_path.to_string_lossy().to_string();
-
-            let registry = Arc::clone(&registry);
-            let file_read_limiter = Arc::clone(&file_read_limiter);
-            if registry.get_support(&rel_path_str).is_none() {
-                return None;
-            }
-
-            let mut output = WorkerOutput {
-                active_path: Some(rel_path_str.clone()),
-                ..WorkerOutput::default()
-            };
-
-            let source = match FileContent::read(path, &file_read_limiter) {
-                Ok(source) => source,
-                Err(err) => {
-                    output.skipped_files.push(SkippedFile {
-                        path: rel_path_str,
-                        reason: format!("failed to read file: {err}"),
-                    });
-                    return Some(output);
-                }
-            };
-            let source_bytes = source.as_bytes();
-            let content_hash = stable_content_hash(source_bytes);
-
-            let mut functions = if let Some(cached_entry) = cache.files.get(&rel_path_str) {
-                if cached_entry.content_hash == content_hash {
-                    output.cache_hit = 1;
-                    cached_entry.functions.clone()
-                } else {
-                    output.cache_miss = 1;
-                    match AnalysisWorker::process_file_from_source(
-                        source_bytes,
-                        &rel_path_str,
-                        &registry,
-                    ) {
-                        Ok(functions) => functions,
-                        Err(err) => {
-                            output.skipped_files.push(SkippedFile {
-                                path: rel_path_str,
-                                reason: format!("failed to analyze file: {err}"),
-                            });
-                            return Some(output);
-                        }
-                    }
-                }
-            } else {
-                output.cache_miss = 1;
-                match AnalysisWorker::process_file_from_source(
-                    source_bytes,
-                    &rel_path_str,
-                    &registry,
-                ) {
-                    Ok(functions) => functions,
-                    Err(err) => {
-                        output.skipped_files.push(SkippedFile {
-                            path: rel_path_str,
-                            reason: format!("failed to analyze file: {err}"),
-                        });
-                        return Some(output);
-                    }
-                }
-            };
-
-            if let Some(entry) = git_cache.get(&rel_path_str) {
-                for func in &mut functions {
-                    let churn = GitAnalyzer::compute_churn_metrics_for_range(
-                        entry,
-                        func.line,
-                        func.end_line,
-                    );
-                    func.times_modified = churn.times_modified;
-                    func.bug_fix_commits = churn.bug_fix_commits;
-                    func.authors_count = churn.authors_count;
-                    func.authors = if include_authors {
-                        Some(churn.authors.clone())
-                    } else {
-                        None
-                    };
-                    func.churn = GitAnalyzer::churn_details(&churn);
-                    func.churn_score = churn.churn_score;
-                    func.file = rel_path_str.clone();
-                }
-            }
-
-            output.cache_entry = Some((
-                rel_path_str,
-                FileCacheEntry {
-                    content_hash,
-                    functions: functions.clone(),
-                },
-            ));
-            output.functions = functions;
-
-            Some(output)
+            process_walk_entry(
+                entry,
+                repo_path_abs,
+                Arc::clone(&registry),
+                cache,
+                git_cache,
+                include_authors,
+                Arc::clone(&file_read_limiter),
+                &shutdown,
+            )
         })
         .fold(WorkerAccumulator::default, |mut acc, output| {
             acc.functions.extend(output.functions);
@@ -1316,6 +1238,177 @@ fn analyze_files_parallel(
             acc
         })
         .into_parts()
+}
+
+fn process_walk_entry(
+    entry: std::result::Result<ignore::DirEntry, ignore::Error>,
+    repo_path_abs: &Path,
+    registry: Arc<LanguageRegistry>,
+    cache: &AnalysisCache,
+    git_cache: &HashMap<String, GitCacheEntry>,
+    include_authors: bool,
+    file_read_limiter: Arc<FileReadLimiter>,
+    shutdown: &AtomicBool,
+) -> Option<WorkerOutput> {
+    if shutdown.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let entry = match entry {
+        Ok(e) => e,
+        Err(err) => return Some(walk_entry_failed_output(err)),
+    };
+
+    let path = entry.path();
+    if !path.is_file() {
+        return None;
+    }
+
+    let rel_path_str = match relative_path_string(path, repo_path_abs) {
+        Ok(path) => path,
+        Err(err) => return Some(err),
+    };
+
+    if registry.get_support(&rel_path_str).is_none() {
+        return None;
+    }
+
+    analyze_supported_file(
+        path,
+        rel_path_str,
+        registry,
+        cache,
+        git_cache,
+        include_authors,
+        file_read_limiter,
+    )
+}
+
+fn walk_entry_failed_output(err: ignore::Error) -> WorkerOutput {
+    WorkerOutput {
+        warnings: vec![AnalysisWarning {
+            code: "walk_entry_failed".to_string(),
+            message: format!("Failed to read directory entry: {err}"),
+        }],
+        ..WorkerOutput::default()
+    }
+}
+
+fn relative_path_string(path: &Path, repo_path_abs: &Path) -> Result<String, WorkerOutput> {
+    match path.strip_prefix(repo_path_abs) {
+        Ok(path) => Ok(path.to_string_lossy().to_string()),
+        Err(err) => Err(WorkerOutput {
+            warnings: vec![AnalysisWarning {
+                code: "path_error".to_string(),
+                message: format!("Failed to strip prefix for {}: {}", path.display(), err),
+            }],
+            ..WorkerOutput::default()
+        }),
+    }
+}
+
+fn analyze_supported_file(
+    path: &Path,
+    rel_path_str: String,
+    registry: Arc<LanguageRegistry>,
+    cache: &AnalysisCache,
+    git_cache: &HashMap<String, GitCacheEntry>,
+    include_authors: bool,
+    file_read_limiter: Arc<FileReadLimiter>,
+) -> Option<WorkerOutput> {
+    let mut output = WorkerOutput {
+        active_path: Some(rel_path_str.clone()),
+        ..WorkerOutput::default()
+    };
+
+    let source = match FileContent::read(path, &file_read_limiter) {
+        Ok(source) => source,
+        Err(err) => {
+            output.skipped_files.push(SkippedFile {
+                path: rel_path_str,
+                reason: format!("failed to read file: {err}"),
+            });
+            return Some(output);
+        }
+    };
+    let source_bytes = source.as_bytes();
+    let content_hash = stable_content_hash(source_bytes);
+    let mut functions = match cached_or_analyzed_functions(
+        cache,
+        &rel_path_str,
+        source_bytes,
+        &content_hash,
+        &registry,
+        &mut output,
+    ) {
+        Some(functions) => functions,
+        None => return Some(output),
+    };
+
+    apply_git_metrics_to_functions(&mut functions, git_cache, &rel_path_str, include_authors);
+    output.cache_entry = Some((
+        rel_path_str,
+        FileCacheEntry {
+            content_hash,
+            functions: functions.clone(),
+        },
+    ));
+    output.functions = functions;
+
+    Some(output)
+}
+
+fn cached_or_analyzed_functions(
+    cache: &AnalysisCache,
+    rel_path_str: &str,
+    source_bytes: &[u8],
+    content_hash: &str,
+    registry: &LanguageRegistry,
+    output: &mut WorkerOutput,
+) -> Option<Vec<FunctionMetrics>> {
+    if let Some(cached_entry) = cache.files.get(rel_path_str) {
+        if cached_entry.content_hash == content_hash {
+            output.cache_hit = 1;
+            return Some(cached_entry.functions.clone());
+        }
+    }
+
+    output.cache_miss = 1;
+    match AnalysisWorker::process_file_from_source(source_bytes, rel_path_str, registry) {
+        Ok(functions) => Some(functions),
+        Err(err) => {
+            output.skipped_files.push(SkippedFile {
+                path: rel_path_str.to_string(),
+                reason: format!("failed to analyze file: {err}"),
+            });
+            None
+        }
+    }
+}
+
+fn apply_git_metrics_to_functions(
+    functions: &mut [FunctionMetrics],
+    git_cache: &HashMap<String, GitCacheEntry>,
+    rel_path_str: &str,
+    include_authors: bool,
+) {
+    if let Some(entry) = git_cache.get(rel_path_str) {
+        for func in functions {
+            let churn =
+                GitAnalyzer::compute_churn_metrics_for_range(entry, func.line, func.end_line);
+            func.times_modified = churn.times_modified;
+            func.bug_fix_commits = churn.bug_fix_commits;
+            func.authors_count = churn.authors_count;
+            func.authors = if include_authors {
+                Some(churn.authors.clone())
+            } else {
+                None
+            };
+            func.churn = GitAnalyzer::churn_details(&churn);
+            func.churn_score = churn.churn_score;
+            func.file = rel_path_str.to_string();
+        }
+    }
 }
 
 fn compute_scoring_context(functions: &[FunctionMetrics]) -> ScoringContext {

@@ -170,21 +170,9 @@ impl<'a> ComplexityEngine<'a> {
     ) {
         match node.kind() {
             kind if is_nesting_complexity_node(kind) => {
-                if is_else_if(node, kind) {
-                    function.cognitive += 1;
-                } else {
-                    function.cognitive += 1 + active_depth;
-                    state.child_depth += 1;
-                }
+                increment_nesting_cognitive(node, kind, function, active_depth, state);
             }
-            "binary_expression" => {
-                if let Some(op) = logical_operator(node) {
-                    if last_op != Some(op) {
-                        function.cognitive += 1;
-                    }
-                    state.logical_operator = Some(op);
-                }
-            }
+            "binary_expression" => increment_logical_cognitive(node, function, last_op, state),
             _ => {}
         }
     }
@@ -342,6 +330,35 @@ impl<'a> ComplexityEngine<'a> {
             documentation_quality,
             identifier_verbosity,
         }
+    }
+}
+
+fn increment_nesting_cognitive(
+    node: Node,
+    kind: &str,
+    function: &mut FunctionState,
+    active_depth: u32,
+    state: &mut NodeState,
+) {
+    if is_else_if(node, kind) {
+        function.cognitive += 1;
+    } else {
+        function.cognitive += 1 + active_depth;
+        state.child_depth += 1;
+    }
+}
+
+fn increment_logical_cognitive(
+    node: Node,
+    function: &mut FunctionState,
+    last_op: Option<&'static str>,
+    state: &mut NodeState,
+) {
+    if let Some(op) = logical_operator(node) {
+        if last_op != Some(op) {
+            function.cognitive += 1;
+        }
+        state.logical_operator = Some(op);
     }
 }
 
