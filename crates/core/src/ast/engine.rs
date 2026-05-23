@@ -58,23 +58,36 @@ impl<'a> ComplexityEngine<'a> {
         let mut functions = Vec::new();
         let mut traversal_stack = vec![TraversalEvent::Enter(root_node, 0, None)];
 
+        self.drain_traversal_stack(
+            &mut function_stack,
+            &mut functions,
+            &mut traversal_stack,
+        );
+
+        Ok(functions.into_iter().flatten().collect())
+    }
+
+    fn drain_traversal_stack<'tree>(
+        &self,
+        function_stack: &mut Vec<FunctionState>,
+        functions: &mut Vec<Option<FunctionMetrics>>,
+        traversal_stack: &mut Vec<TraversalEvent<'tree>>,
+    ) {
         while let Some(event) = traversal_stack.pop() {
             match event {
                 TraversalEvent::Enter(node, depth, last_op) => self.enter_node(
                     node,
-                    &mut function_stack,
-                    &mut functions,
-                    &mut traversal_stack,
+                    function_stack,
+                    functions,
+                    traversal_stack,
                     depth,
                     last_op,
                 ),
                 TraversalEvent::ExitFunction(node) => {
-                    self.finish_function(node, &mut function_stack, &mut functions);
+                    self.finish_function(node, function_stack, functions);
                 }
             }
         }
-
-        Ok(functions.into_iter().flatten().collect())
     }
 
     fn enter_node<'tree>(
@@ -257,6 +270,30 @@ impl<'a> ComplexityEngine<'a> {
     fn analyze_body_quality(&self, node: Node, cognitive_complexity: u32) -> BodyQuality {
         let text = node.utf8_text(self.source.as_bytes()).unwrap_or_default();
         let body_hash = stable_hash_hex(text.as_bytes());
+        let (comment_lines, comment_ratio) = self.body_line_quality(text);
+        let placeholder_count = count_placeholders(text);
+        let docstring_chars = leading_docstring_chars(node, self.source);
+        let has_docstring = docstring_chars > 0;
+        let documentation_quality = documentation_quality(docstring_chars, cognitive_complexity);
+        let traversal = self.body_traversal_quality(node);
+
+        let is_hollow = traversal.executable_statements == 0;
+        let hollow_kind = self.hollow_kind(is_hollow, comment_lines);
+
+        BodyQuality {
+            body_hash,
+            executable_statements: traversal.executable_statements,
+            is_hollow,
+            hollow_kind,
+            comment_ratio,
+            placeholder_count,
+            has_docstring,
+            documentation_quality,
+            identifier_verbosity: traversal.identifier_verbosity,
+        }
+    }
+
+    fn body_line_quality(&self, text: &str) -> (usize, f64) {
         let comment_lines = text
             .lines()
             .filter(|line| is_comment_line(line.trim()))
@@ -267,11 +304,10 @@ impl<'a> ComplexityEngine<'a> {
         } else {
             comment_lines as f64 / total_lines as f64
         };
-        let placeholder_count = count_placeholders(text);
-        let docstring_chars = leading_docstring_chars(node, self.source);
-        let has_docstring = docstring_chars > 0;
-        let documentation_quality = documentation_quality(docstring_chars, cognitive_complexity);
+        (comment_lines, comment_ratio)
+    }
 
+    fn body_traversal_quality(&self, node: Node) -> BodyTraversalQuality {
         let mut executable_statements = 0;
         let mut identifier_total = 0usize;
         let mut identifier_count = 0usize;
@@ -308,8 +344,15 @@ impl<'a> ComplexityEngine<'a> {
         } else {
             identifier_total as f64 / identifier_count as f64
         };
-        let is_hollow = executable_statements == 0;
-        let hollow_kind = if is_hollow {
+
+        BodyTraversalQuality {
+            executable_statements,
+            identifier_verbosity,
+        }
+    }
+
+    fn hollow_kind(&self, is_hollow: bool, comment_lines: usize) -> String {
+        if is_hollow {
             if comment_lines > 0 {
                 "comment_only".to_string()
             } else {
@@ -317,20 +360,13 @@ impl<'a> ComplexityEngine<'a> {
             }
         } else {
             "none".to_string()
-        };
-
-        BodyQuality {
-            body_hash,
-            executable_statements,
-            is_hollow,
-            hollow_kind,
-            comment_ratio,
-            placeholder_count,
-            has_docstring,
-            documentation_quality,
-            identifier_verbosity,
         }
     }
+}
+
+struct BodyTraversalQuality {
+    executable_statements: u32,
+    identifier_verbosity: f64,
 }
 
 fn increment_nesting_cognitive(

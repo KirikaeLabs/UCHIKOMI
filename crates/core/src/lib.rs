@@ -208,34 +208,17 @@ pub fn analyze_repository_with_authors(
             code: "no_functions_found".to_string(),
             message: "No functions found to analyze.".to_string(),
         });
-        let quality = build_quality(
+        return Ok(empty_analysis_report(
+            &ctx,
+            scoring_policy,
             git_status,
-            ctx.cache_manager.is_some(),
-            ctx.cache_loaded,
-            false,
             cache_stats,
             warnings,
             skipped_files,
-        );
-        return Ok(Report {
-            schema_version: SCHEMA_VERSION.to_string(),
-            analysis: analysis_metadata(
-                &ctx.repo_path_abs,
-                &ctx.commit_hash,
-                &ctx.branch,
-                &ctx.timestamp,
-            ),
-            scoring_policy,
-            summary: SummaryStats {
-                total_functions: 0,
-                project_stats: build_project_stats(&functions, &git_cache, total_unique_authors),
-                coverage: build_project_coverage(&functions),
-                max_values: None,
-                distributions: None,
-            },
-            quality,
             functions,
-        });
+            &git_cache,
+            total_unique_authors,
+        ));
     }
 
     apply_coupling_and_reachability(&mut functions);
@@ -287,6 +270,48 @@ pub fn analyze_repository_with_authors(
         quality,
         functions,
     })
+}
+
+fn empty_analysis_report(
+    ctx: &RepoContext,
+    scoring_policy: ScoringPolicy,
+    git_status: GitAnalysisStatus,
+    cache_stats: CacheStats,
+    warnings: Vec<AnalysisWarning>,
+    skipped_files: Vec<SkippedFile>,
+    functions: Vec<FunctionMetrics>,
+    git_cache: &HashMap<String, GitCacheEntry>,
+    total_unique_authors: usize,
+) -> Report {
+    let quality = build_quality(
+        git_status,
+        ctx.cache_manager.is_some(),
+        ctx.cache_loaded,
+        false,
+        cache_stats,
+        warnings,
+        skipped_files,
+    );
+
+    Report {
+        schema_version: SCHEMA_VERSION.to_string(),
+        analysis: analysis_metadata(
+            &ctx.repo_path_abs,
+            &ctx.commit_hash,
+            &ctx.branch,
+            &ctx.timestamp,
+        ),
+        scoring_policy,
+        summary: SummaryStats {
+            total_functions: 0,
+            project_stats: build_project_stats(&functions, git_cache, total_unique_authors),
+            coverage: build_project_coverage(&functions),
+            max_values: None,
+            distributions: None,
+        },
+        quality,
+        functions,
+    }
 }
 
 fn configured_bug_fix_patterns(
@@ -342,17 +367,16 @@ fn analysis_metadata(
 }
 
 fn repository_metadata(repo: &Repository) -> (String, String, String) {
-    let head = match repo.head() {
-        Ok(head) => head,
+    match repo.head() {
+        Ok(head) => metadata_from_head(head),
         Err(err) => {
             log::warn!("Git HEAD unavailable: {}", err);
-            return (
-                "unknown".to_string(),
-                String::new(),
-                FALLBACK_TIMESTAMP.to_string(),
-            );
+            unknown_repository_metadata()
         }
-    };
+    }
+}
+
+fn metadata_from_head(head: git2::Reference<'_>) -> (String, String, String) {
     let branch_name = head.shorthand().unwrap_or("unknown").to_string();
 
     let commit = match head.peel_to_commit() {
@@ -365,6 +389,14 @@ fn repository_metadata(repo: &Repository) -> (String, String, String) {
 
     let timestamp = commit_timestamp(&commit).unwrap_or_else(|| FALLBACK_TIMESTAMP.to_string());
     (branch_name, commit.id().to_string(), timestamp)
+}
+
+fn unknown_repository_metadata() -> (String, String, String) {
+    (
+        "unknown".to_string(),
+        String::new(),
+        FALLBACK_TIMESTAMP.to_string(),
+    )
 }
 
 fn commit_timestamp(commit: &git2::Commit) -> Option<String> {
@@ -418,39 +450,56 @@ fn sort_functions(
     sort_by: &str,
     warnings: &mut Vec<AnalysisWarning>,
 ) {
-    match sort_by {
-        "file" | "location" => sort_by_location(functions),
-        "churn_score" | "churn" => functions.sort_by(|a, b| {
-            b.churn_score
-                .total_cmp(&a.churn_score)
-                .then_with(|| location_order(a, b))
-        }),
-        "risk" | "risk_score" => functions.sort_by(|a, b| {
-            risk_score(b)
-                .total_cmp(&risk_score(a))
-                .then_with(|| location_order(a, b))
-        }),
-        "cognitive" | "cognitive_complexity" => functions.sort_by(|a, b| {
-            b.cognitive_complexity
-                .cmp(&a.cognitive_complexity)
-                .then_with(|| location_order(a, b))
-        }),
-        "cyclomatic" | "cyclomatic_complexity" => functions.sort_by(|a, b| {
-            b.cyclomatic_complexity
-                .cmp(&a.cyclomatic_complexity)
-                .then_with(|| location_order(a, b))
-        }),
-        "loc" | "lines_of_code" => functions.sort_by(|a, b| {
-            b.lines_of_code
-                .cmp(&a.lines_of_code)
-                .then_with(|| location_order(a, b))
-        }),
-        other => {
+    match SortKey::from_str(sort_by) {
+        Some(SortKey::Location) => sort_by_location(functions),
+        Some(sort_key) => functions.sort_by(|a, b| sort_key.compare(a, b)),
+        None => {
             warnings.push(AnalysisWarning {
                 code: "unsupported_sort".to_string(),
-                message: format!("Unsupported sort field '{other}'. Falling back to file order."),
+                message: format!("Unsupported sort field '{sort_by}'. Falling back to file order."),
             });
             sort_by_location(functions);
+        }
+    }
+}
+
+enum SortKey {
+    Location,
+    Churn,
+    Risk,
+    Cognitive,
+    Cyclomatic,
+    LinesOfCode,
+}
+
+impl SortKey {
+    fn from_str(sort_by: &str) -> Option<Self> {
+        match sort_by {
+            "file" | "location" => Some(Self::Location),
+            "churn_score" | "churn" => Some(Self::Churn),
+            "risk" | "risk_score" => Some(Self::Risk),
+            "cognitive" | "cognitive_complexity" => Some(Self::Cognitive),
+            "cyclomatic" | "cyclomatic_complexity" => Some(Self::Cyclomatic),
+            "loc" | "lines_of_code" => Some(Self::LinesOfCode),
+            _ => None,
+        }
+    }
+
+    fn compare(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
+        match self {
+            Self::Location => location_order(a, b),
+            _ => self.metric_ordering(a, b).then_with(|| location_order(a, b)),
+        }
+    }
+
+    fn metric_ordering(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
+        match self {
+            Self::Location => CmpOrdering::Equal,
+            Self::Churn => b.churn_score.total_cmp(&a.churn_score),
+            Self::Risk => risk_score(b).total_cmp(&risk_score(a)),
+            Self::Cognitive => b.cognitive_complexity.cmp(&a.cognitive_complexity),
+            Self::Cyclomatic => b.cyclomatic_complexity.cmp(&a.cyclomatic_complexity),
+            Self::LinesOfCode => b.lines_of_code.cmp(&a.lines_of_code),
         }
     }
 }
@@ -479,6 +528,18 @@ fn build_project_stats(
     git_cache: &HashMap<String, GitCacheEntry>,
     total_unique_authors: usize,
 ) -> metrics::ProjectStats {
+    let author_contributions = author_contributions(git_cache);
+
+    metrics::ProjectStats {
+        total_unique_authors,
+        bus_factor: bus_factor(author_contributions),
+        tech_debt_density: tech_debt_density(functions),
+        top_hotspots: top_hotspots(functions),
+        dead_code: build_dead_code_stats(functions),
+    }
+}
+
+fn author_contributions(git_cache: &HashMap<String, GitCacheEntry>) -> HashMap<String, usize> {
     let mut author_contributions: HashMap<String, usize> = HashMap::new();
     for entry in git_cache.values() {
         if entry.line_changes.is_empty() {
@@ -493,26 +554,31 @@ fn build_project_stats(
             }
         }
     }
+    author_contributions
+}
 
+fn bus_factor(author_contributions: HashMap<String, usize>) -> usize {
     let total_contributions = author_contributions.values().sum::<usize>();
-    let bus_factor = if total_contributions == 0 {
-        0
-    } else {
-        let mut counts = author_contributions.into_values().collect::<Vec<_>>();
-        counts.sort_by(|a, b| b.cmp(a));
-        let majority = total_contributions.div_ceil(2);
-        let mut accumulated = 0usize;
-        let mut authors = 0usize;
-        for count in counts {
-            accumulated += count;
-            authors += 1;
-            if accumulated >= majority {
-                break;
-            }
-        }
-        authors
-    };
+    if total_contributions == 0 {
+        return 0;
+    }
 
+    let mut counts = author_contributions.into_values().collect::<Vec<_>>();
+    counts.sort_by(|a, b| b.cmp(a));
+    let majority = total_contributions.div_ceil(2);
+    let mut accumulated = 0usize;
+    let mut authors = 0usize;
+    for count in counts {
+        accumulated += count;
+        authors += 1;
+        if accumulated >= majority {
+            break;
+        }
+    }
+    authors
+}
+
+fn tech_debt_density(functions: &[FunctionMetrics]) -> f64 {
     let total_loc = functions
         .iter()
         .map(|function| function.lines_of_code)
@@ -521,12 +587,14 @@ fn build_project_stats(
         .iter()
         .map(|function| function.cognitive_complexity + function.cyclomatic_complexity)
         .sum::<u32>();
-    let tech_debt_density = if total_loc == 0 {
+    if total_loc == 0 {
         0.0
     } else {
         total_complexity as f64 / total_loc as f64
-    };
+    }
+}
 
+fn top_hotspots(functions: &[FunctionMetrics]) -> Vec<metrics::Hotspot> {
     let mut hotspots = functions
         .iter()
         .map(|function| metrics::Hotspot {
@@ -548,14 +616,7 @@ fn build_project_stats(
             .then_with(|| a.line.cmp(&b.line))
     });
     hotspots.truncate(5);
-
-    metrics::ProjectStats {
-        total_unique_authors,
-        bus_factor,
-        tech_debt_density,
-        top_hotspots: hotspots,
-        dead_code: build_dead_code_stats(functions),
-    }
+    hotspots
 }
 
 fn build_dead_code_stats(functions: &[FunctionMetrics]) -> metrics::DeadCodeStats {
@@ -609,6 +670,20 @@ fn build_project_coverage(functions: &[FunctionMetrics]) -> Option<metrics::Proj
 }
 
 fn apply_coupling_and_reachability(functions: &mut [FunctionMetrics]) {
+    let by_name = function_indexes_by_name(functions);
+    let (mut callers_by_index, mut callees_by_index, reachable) =
+        collect_coupling_links(functions, &by_name);
+
+    for (index, function) in functions.iter_mut().enumerate() {
+        sort_and_dedup(&mut callers_by_index[index]);
+        sort_and_dedup(&mut callees_by_index[index]);
+
+        apply_coupling_metrics(function, &callers_by_index[index], &callees_by_index[index]);
+        mark_reachable_if_needed(function, reachable[index]);
+    }
+}
+
+fn function_indexes_by_name(functions: &[FunctionMetrics]) -> HashMap<String, Vec<usize>> {
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, function) in functions.iter().enumerate() {
         by_name
@@ -616,7 +691,13 @@ fn apply_coupling_and_reachability(functions: &mut [FunctionMetrics]) {
             .or_default()
             .push(index);
     }
+    by_name
+}
 
+fn collect_coupling_links(
+    functions: &[FunctionMetrics],
+    by_name: &HashMap<String, Vec<usize>>,
+) -> (Vec<Vec<String>>, Vec<Vec<String>>, Vec<bool>) {
     let mut callers_by_index: Vec<Vec<String>> = vec![Vec::new(); functions.len()];
     let mut callees_by_index: Vec<Vec<String>> = vec![Vec::new(); functions.len()];
     let mut reachable = vec![false; functions.len()];
@@ -639,38 +720,47 @@ fn apply_coupling_and_reachability(functions: &mut [FunctionMetrics]) {
         }
     }
 
-    for (index, function) in functions.iter_mut().enumerate() {
-        sort_and_dedup(&mut callers_by_index[index]);
-        sort_and_dedup(&mut callees_by_index[index]);
+    (callers_by_index, callees_by_index, reachable)
+}
 
-        let fan_in = callers_by_index[index].len();
-        let fan_out = callees_by_index[index].len();
-        let denominator = fan_in + fan_out;
-        function.coupling = metrics::CouplingMetrics {
-            fan_in,
-            fan_out,
-            callers: callers_by_index[index].clone(),
-            callees: callees_by_index[index].clone(),
-            instability: if denominator == 0 {
-                0.0
-            } else {
-                fan_out as f64 / denominator as f64
-            },
-        };
+fn apply_coupling_metrics(
+    function: &mut FunctionMetrics,
+    callers: &[String],
+    callees: &[String],
+) {
+    let fan_in = callers.len();
+    let fan_out = callees.len();
+    let denominator = fan_in + fan_out;
+    function.coupling = metrics::CouplingMetrics {
+        fan_in,
+        fan_out,
+        callers: callers.to_vec(),
+        callees: callees.to_vec(),
+        instability: if denominator == 0 {
+            0.0
+        } else {
+            fan_out as f64 / denominator as f64
+        },
+    };
+}
 
-        let public_or_exported = function.reachability.kind == "unreachable_export";
-        if reachable[index] || public_or_exported || function.name == "main" {
-            function.reachability.is_reachable = true;
-            function.reachability.kind = if function.file.contains("/tests/")
-                || function.file.ends_with("_test.rs")
-                || function.file.ends_with(".test.ts")
-                || function.file.ends_with(".spec.ts")
-            {
-                "test_only".to_string()
-            } else {
-                "reachable".to_string()
-            };
-        }
+fn mark_reachable_if_needed(function: &mut FunctionMetrics, reachable: bool) {
+    let public_or_exported = function.reachability.kind == "unreachable_export";
+    if reachable || public_or_exported || function.name == "main" {
+        function.reachability.is_reachable = true;
+        function.reachability.kind = reachability_kind(function);
+    }
+}
+
+fn reachability_kind(function: &FunctionMetrics) -> String {
+    if function.file.contains("/tests/")
+        || function.file.ends_with("_test.rs")
+        || function.file.ends_with(".test.ts")
+        || function.file.ends_with(".spec.ts")
+    {
+        "test_only".to_string()
+    } else {
+        "reachable".to_string()
     }
 }
 
@@ -983,18 +1073,23 @@ fn load_analysis_cache(
     cache_manager: &Option<CacheManager>,
     warnings: &mut Vec<AnalysisWarning>,
 ) -> AnalysisCache {
-    match cache_manager {
-        Some(cm) => match cm.load() {
-            Ok(cache) => cache,
-            Err(err) => {
-                warnings.push(AnalysisWarning {
-                    code: "cache_load_failed".to_string(),
-                    message: format!("Failed to load cache: {err}"),
-                });
-                AnalysisCache::default()
-            }
-        },
-        None => AnalysisCache::default(),
+    let Some(cm) = cache_manager else {
+        return AnalysisCache::default();
+    };
+
+    match cm.load() {
+        Ok(cache) => cache,
+        Err(err) => {
+            warnings.push(cache_load_failed_warning(err));
+            AnalysisCache::default()
+        }
+    }
+}
+
+fn cache_load_failed_warning(err: anyhow::Error) -> AnalysisWarning {
+    AnalysisWarning {
+        code: "cache_load_failed".to_string(),
+        message: format!("Failed to load cache: {err}"),
     }
 }
 
@@ -1146,43 +1241,55 @@ fn collect_git_analysis(
         processed_commits: 0,
     };
 
-    let git_cache = match repo {
-        Some(repo) => match GitAnalyzer::get_all_file_metrics(
-            repo,
-            std::mem::take(&mut cache.git_cache),
-            cache.git_metadata.clone(),
-            cache.last_commit_oid.clone(),
-            repo_path_abs,
-            branch,
-            commit_hash,
-            bug_fix_patterns,
-        ) {
-            Ok(git_result) => {
-                git_status.partial = git_result.partial;
-                git_status.cache_reset = git_result.cache_reset;
-                git_status.processed_commits = git_result.processed_commits;
-                for warning in git_result.warnings {
-                    warnings.push(AnalysisWarning {
-                        code: "git_partial".to_string(),
-                        message: warning,
-                    });
-                }
-                cache.git_metadata = Some(git_result.metadata);
-                git_result.cache
-            }
-            Err(err) => {
-                git_status.partial = true;
-                warnings.push(AnalysisWarning {
-                    code: "git_metrics_failed".to_string(),
-                    message: format!("Failed to collect Git metrics: {err}"),
-                });
-                HashMap::new()
-            }
-        },
-        None => HashMap::new(),
+    let Some(repo) = repo else {
+        return (HashMap::new(), git_status);
+    };
+
+    let git_cache = match GitAnalyzer::get_all_file_metrics(
+        repo,
+        std::mem::take(&mut cache.git_cache),
+        cache.git_metadata.clone(),
+        cache.last_commit_oid.clone(),
+        repo_path_abs,
+        branch,
+        commit_hash,
+        bug_fix_patterns,
+    ) {
+        Ok(git_result) => apply_git_metrics_result(git_result, cache, &mut git_status, warnings),
+        Err(err) => {
+            git_status.partial = true;
+            warnings.push(git_metrics_failed_warning(err));
+            HashMap::new()
+        }
     };
 
     (git_cache, git_status)
+}
+
+fn apply_git_metrics_result(
+    git_result: git::GitMetricsResult,
+    cache: &mut AnalysisCache,
+    git_status: &mut GitAnalysisStatus,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> HashMap<String, GitCacheEntry> {
+    git_status.partial = git_result.partial;
+    git_status.cache_reset = git_result.cache_reset;
+    git_status.processed_commits = git_result.processed_commits;
+    for warning in git_result.warnings {
+        warnings.push(AnalysisWarning {
+            code: "git_partial".to_string(),
+            message: warning,
+        });
+    }
+    cache.git_metadata = Some(git_result.metadata);
+    git_result.cache
+}
+
+fn git_metrics_failed_warning(err: anyhow::Error) -> AnalysisWarning {
+    AnalysisWarning {
+        code: "git_metrics_failed".to_string(),
+        message: format!("Failed to collect Git metrics: {err}"),
+    }
 }
 
 fn analyze_files_parallel(
