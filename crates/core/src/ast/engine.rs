@@ -85,6 +85,16 @@ impl<'a> ComplexityEngine<'a> {
         functions: &mut Vec<Option<FunctionMetrics>>,
         traversal_stack: &mut Vec<TraversalEvent<'tree>>,
     ) {
+        self.dispatch_traversal_event(event, function_stack, functions, traversal_stack);
+    }
+
+    fn dispatch_traversal_event<'tree>(
+        &self,
+        event: TraversalEvent<'tree>,
+        function_stack: &mut Vec<FunctionState>,
+        functions: &mut Vec<Option<FunctionMetrics>>,
+        traversal_stack: &mut Vec<TraversalEvent<'tree>>,
+    ) {
         match event {
             TraversalEvent::Enter(node, depth, last_op) => self.enter_node(
                 node,

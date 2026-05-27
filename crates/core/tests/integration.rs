@@ -31,13 +31,7 @@ fn commit_all(repo: &Repository, message: &str) {
     let tree = repo.find_tree(tree_id).expect("tree should exist");
     let signature =
         Signature::now("Test User", "test@example.com").expect("signature should build");
-    let parents = match repo.head() {
-        Ok(head) => {
-            let parent = head.peel_to_commit().expect("head should peel to commit");
-            vec![parent]
-        }
-        Err(_) => Vec::new(),
-    };
+    let parents = commit_parents(repo);
     let parent_refs = parents.iter().collect::<Vec<_>>();
     repo.commit(
         Some("HEAD"),
@@ -48,6 +42,16 @@ fn commit_all(repo: &Repository, message: &str) {
         &parent_refs,
     )
     .expect("commit should be created");
+}
+
+fn commit_parents(repo: &Repository) -> Vec<git2::Commit<'_>> {
+    match repo.head() {
+        Ok(head) => {
+            let parent = head.peel_to_commit().expect("head should peel to commit");
+            vec![parent]
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 fn write_source(repo_path: &Path, source: &str) {

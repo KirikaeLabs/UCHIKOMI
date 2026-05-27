@@ -228,9 +228,7 @@ pub fn analyze_repository_with_authors(
     let project_stats = build_project_stats(&functions, &git_cache, total_unique_authors);
 
     sort_functions(&mut functions, sort_by, &mut warnings);
-    if let Some(limit) = limit {
-        functions.truncate(limit);
-    }
+    apply_function_limit(&mut functions, limit);
 
     let cache_saved = save_analysis_cache(
         &ctx.cache_manager,
@@ -270,6 +268,12 @@ pub fn analyze_repository_with_authors(
         quality,
         functions,
     })
+}
+
+fn apply_function_limit(functions: &mut Vec<FunctionMetrics>, limit: Option<usize>) {
+    if let Some(limit) = limit {
+        functions.truncate(limit);
+    }
 }
 
 fn empty_analysis_report(
@@ -474,15 +478,15 @@ enum SortKey {
 
 impl SortKey {
     fn from_str(sort_by: &str) -> Option<Self> {
-        Some(match sort_by {
-            "file" | "location" => Self::Location,
-            "churn_score" | "churn" => Self::Churn,
-            "risk" | "risk_score" => Self::Risk,
-            "cognitive" | "cognitive_complexity" => Self::Cognitive,
-            "cyclomatic" | "cyclomatic_complexity" => Self::Cyclomatic,
-            "loc" | "lines_of_code" => Self::LinesOfCode,
-            _ => return None,
-        })
+        match sort_by {
+            "file" | "location" => Some(Self::Location),
+            "churn_score" | "churn" => Some(Self::Churn),
+            "risk" | "risk_score" => Some(Self::Risk),
+            "cognitive" | "cognitive_complexity" => Some(Self::Cognitive),
+            "cyclomatic" | "cyclomatic_complexity" => Some(Self::Cyclomatic),
+            "loc" | "lines_of_code" => Some(Self::LinesOfCode),
+            _ => None,
+        }
     }
 
     fn compare(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
@@ -1444,15 +1448,9 @@ fn analyze_supported_file(
         ..WorkerOutput::default()
     };
 
-    let source = match FileContent::read(path, &file_read_limiter) {
-        Ok(source) => source,
-        Err(err) => {
-            output.skipped_files.push(SkippedFile {
-                path: rel_path_str,
-                reason: format!("failed to read file: {err}"),
-            });
-            return Some(output);
-        }
+    let Some(source) = read_supported_file(path, &rel_path_str, &file_read_limiter, &mut output)
+    else {
+        return Some(output);
     };
     let source_bytes = source.as_bytes();
     let content_hash = stable_content_hash(source_bytes);
@@ -1479,6 +1477,24 @@ fn analyze_supported_file(
     output.functions = functions;
 
     Some(output)
+}
+
+fn read_supported_file(
+    path: &Path,
+    rel_path_str: &str,
+    file_read_limiter: &FileReadLimiter,
+    output: &mut WorkerOutput,
+) -> Option<FileContent> {
+    match FileContent::read(path, file_read_limiter) {
+        Ok(source) => Some(source),
+        Err(err) => {
+            output.skipped_files.push(SkippedFile {
+                path: rel_path_str.to_string(),
+                reason: format!("failed to read file: {err}"),
+            });
+            None
+        }
+    }
 }
 
 fn cached_or_analyzed_functions(
