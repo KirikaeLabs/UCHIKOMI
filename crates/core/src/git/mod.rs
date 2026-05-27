@@ -159,37 +159,56 @@ impl GitAnalyzer {
         let Some(oid_str) = last_commit_oid else {
             return Ok(false);
         };
-
         let head = Oid::from_str(head_oid)?;
-        match Oid::from_str(oid_str) {
-            Ok(oid) if oid == head => Ok(true),
-            Ok(oid) if repo.graph_descendant_of(head, oid).unwrap_or(false) => {
-                if let Err(err) = revwalk.hide(oid) {
-                    git_cache.clear();
-                    result.cache_reset = true;
-                    result.warnings.push(format!(
-                        "Failed to hide cached Git commit {oid}: {err}. Git cache was rebuilt."
-                    ));
-                }
-                Ok(false)
-            }
-            Ok(oid) => {
-                git_cache.clear();
-                result.cache_reset = true;
-                result.warnings.push(format!(
-                    "Cached Git commit {oid} is not an ancestor of HEAD. Git cache was rebuilt."
-                ));
-                Ok(false)
-            }
+
+        let oid = match Oid::from_str(oid_str) {
+            Ok(oid) => oid,
             Err(err) => {
-                git_cache.clear();
-                result.cache_reset = true;
-                result.warnings.push(format!(
-                    "Cached Git commit '{oid_str}' is invalid: {err}. Git cache was rebuilt."
-                ));
-                Ok(false)
+                Self::reset_git_cache(
+                    git_cache,
+                    result,
+                    format!(
+                        "Cached Git commit '{oid_str}' is invalid: {err}. Git cache was rebuilt."
+                    ),
+                );
+                return Ok(false);
             }
+        };
+
+        if oid == head {
+            return Ok(true);
         }
+
+        if !repo.graph_descendant_of(head, oid).unwrap_or(false) {
+            Self::reset_git_cache(
+                git_cache,
+                result,
+                format!(
+                    "Cached Git commit {oid} is not an ancestor of HEAD. Git cache was rebuilt."
+                ),
+            );
+            return Ok(false);
+        }
+
+        if let Err(err) = revwalk.hide(oid) {
+            Self::reset_git_cache(
+                git_cache,
+                result,
+                format!("Failed to hide cached Git commit {oid}: {err}. Git cache was rebuilt."),
+            );
+        }
+
+        Ok(false)
+    }
+
+    fn reset_git_cache(
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        result: &mut GitMetricsResult,
+        warning: String,
+    ) {
+        git_cache.clear();
+        result.cache_reset = true;
+        result.warnings.push(warning);
     }
 
     fn collect_batch_metrics(

@@ -412,15 +412,15 @@ fn percentile_f64(sorted_values: &[f64], value: f64, total: f64) -> f64 {
         return 100.0;
     }
 
-    let idx = match sorted_values.binary_search_by(|probe| {
-        if probe.total_cmp(&value) == CmpOrdering::Less {
-            CmpOrdering::Less
-        } else {
-            CmpOrdering::Greater
-        }
-    }) {
-        Ok(idx) | Err(idx) => idx,
-    };
+    let idx = sorted_values
+        .binary_search_by(|probe| {
+            if probe.total_cmp(&value) == CmpOrdering::Less {
+                CmpOrdering::Less
+            } else {
+                CmpOrdering::Greater
+            }
+        })
+        .unwrap_or_else(|idx| idx);
     (idx as f64 / (total - 1.0)) * 100.0
 }
 
@@ -1377,29 +1377,15 @@ fn process_walk_entry(
     file_read_limiter: Arc<FileReadLimiter>,
     shutdown: &AtomicBool,
 ) -> Option<WorkerOutput> {
-    if shutdown.load(Ordering::Relaxed) {
-        return None;
-    }
-
-    let entry = match entry {
-        Ok(e) => e,
-        Err(err) => return Some(walk_entry_failed_output(err)),
+    let entry = match prepare_walk_entry(entry, shutdown)? {
+        Ok(entry) => entry,
+        Err(output) => return Some(output),
     };
-
     let path = entry.path();
-    if !path.is_file() {
-        return None;
-    }
-
-    let rel_path_str = match relative_path_string(path, repo_path_abs) {
+    let rel_path_str = match supported_relative_path(path, repo_path_abs, registry.as_ref())? {
         Ok(path) => path,
-        Err(err) => return Some(err),
+        Err(output) => return Some(output),
     };
-
-    if registry.get_support(&rel_path_str).is_none() {
-        return None;
-    }
-
     analyze_supported_file(
         path,
         rel_path_str,
@@ -1409,6 +1395,37 @@ fn process_walk_entry(
         include_authors,
         file_read_limiter,
     )
+}
+
+fn prepare_walk_entry(
+    entry: std::result::Result<ignore::DirEntry, ignore::Error>,
+    shutdown: &AtomicBool,
+) -> Option<Result<ignore::DirEntry, WorkerOutput>> {
+    if shutdown.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    Some(entry.map_err(walk_entry_failed_output))
+}
+
+fn supported_relative_path(
+    path: &Path,
+    repo_path_abs: &Path,
+    registry: &LanguageRegistry,
+) -> Option<Result<String, WorkerOutput>> {
+    if !path.is_file() {
+        return None;
+    }
+
+    let rel_path_str = match relative_path_string(path, repo_path_abs) {
+        Ok(path) => path,
+        Err(err) => return Some(Err(err)),
+    };
+
+    registry
+        .get_support(&rel_path_str)
+        .is_some()
+        .then_some(Ok(rel_path_str))
 }
 
 fn walk_entry_failed_output(err: ignore::Error) -> WorkerOutput {
@@ -1687,51 +1704,7 @@ fn apply_scoring_and_labels(
 ) -> Distributions {
     // Normalize metrics and derive composite risk score.
     for func in functions.iter_mut() {
-        let norm_cog = normalized_value(func.cognitive_complexity as f64, context.caps.cognitive);
-        let norm_cyc = normalized_value(func.cyclomatic_complexity as f64, context.caps.cyclomatic);
-        let norm_churn = normalized_value(func.churn_score, context.caps.churn);
-        let norm_recent_churn =
-            normalized_value(func.churn.windows.d7.score, context.caps.churn_recent);
-        let norm_loc = normalized_value(func.lines_of_code as f64, context.caps.loc);
-        let norm_auth = normalized_value(func.authors_count as f64, context.caps.authors);
-        let norm_fan_in = normalized_value(func.coupling.fan_in as f64, context.caps.fan_in);
-        let coverage_gap = func
-            .coverage
-            .as_ref()
-            .map(|coverage| coverage.risk_coverage_gap);
-        let norm_coverage_gap =
-            coverage_gap.map(|gap| normalized_value(gap, context.caps.coverage_gap));
-
-        func.normalized = Some(NormalizedMetrics {
-            cyclomatic: norm_cyc,
-            churn: norm_churn,
-            churn_recent: norm_recent_churn,
-            cognitive: norm_cog,
-            fan_in: norm_fan_in,
-            loc: norm_loc,
-            authors: norm_auth,
-            coverage_gap: norm_coverage_gap,
-        });
-
-        let base_score = (WEIGHT_COGNITIVE * norm_cog)
-            + (WEIGHT_CYCLOMATIC * norm_cyc)
-            + (WEIGHT_CHURN * norm_churn)
-            + (WEIGHT_CHURN_RECENT * norm_recent_churn)
-            + (WEIGHT_FAN_IN * norm_fan_in)
-            + (WEIGHT_LOC * norm_loc)
-            + (WEIGHT_AUTHORS * norm_auth)
-            + (WEIGHT_COVERAGE_GAP * norm_coverage_gap.unwrap_or(0.0));
-        let nesting_penalty = 1.0 + (func.nesting_depth as f64 / 4.0).powi(2) * 0.20;
-        let fan_in_multiplier = 1.0 + norm_fan_in * 0.25;
-        let final_score = base_score * nesting_penalty * fan_in_multiplier;
-
-        func.risk = Some(RiskMetrics {
-            base_score,
-            nesting_penalty,
-            final_score,
-            level: String::new(),
-            primary_driver: String::new(),
-        });
+        apply_normalized_risk(func, context);
     }
 
     let mut risk_vals: Vec<f64> = functions
@@ -1742,54 +1715,111 @@ fn apply_scoring_and_labels(
 
     let total_funcs = functions.len() as f64;
     for func in functions.iter_mut() {
-        let Some(risk_score) = func.risk.as_ref().map(|risk| risk.final_score) else {
-            continue;
-        };
-        let churn = func.churn_score;
-        let cog = func.cognitive_complexity as f64;
-
-        let risk_pct = percentile_f64(&risk_vals, risk_score, total_funcs);
-
-        func.percentile = Some(PercentileMetrics {
-            risk: risk_pct,
-            churn: percentile_f64(&context.churn_vals, churn, total_funcs),
-            cognitive: percentile_u32(&context.cog_vals, cog as u32, total_funcs),
-        });
-
-        let level = match risk_pct {
-            p if p >= THRESHOLD_CRITICAL => "critical",
-            p if p >= THRESHOLD_HIGH => "high",
-            p if p >= THRESHOLD_MEDIUM => "medium",
-            _ => "low",
-        }
-        .to_string();
-
-        if let Some(norm) = &func.normalized {
-            let mut drivers = [
-                ("cognitive", norm.cognitive * WEIGHT_COGNITIVE),
-                ("churn", norm.churn * WEIGHT_CHURN),
-                ("churn_recent", norm.churn_recent * WEIGHT_CHURN_RECENT),
-                ("fan_in", norm.fan_in * WEIGHT_FAN_IN),
-                ("cyclomatic", norm.cyclomatic * WEIGHT_CYCLOMATIC),
-                ("loc", norm.loc * WEIGHT_LOC),
-                ("authors", norm.authors * WEIGHT_AUTHORS),
-                (
-                    "coverage_gap",
-                    norm.coverage_gap.unwrap_or(0.0) * WEIGHT_COVERAGE_GAP,
-                ),
-            ];
-            drivers.sort_by(|a, b| b.1.total_cmp(&a.1));
-            if let Some(risk) = func.risk.as_mut() {
-                risk.level = level;
-                risk.primary_driver = drivers[0].0.to_string();
-            }
-        }
+        apply_percentiles_and_labels(func, context, &risk_vals, total_funcs);
     }
 
     Distributions {
         risk_p95: risk_vals[context.p95_idx],
         churn_p95: context.churn_vals[context.p95_idx],
         cognitive_p95: context.cog_vals[context.p95_idx] as f64,
+    }
+}
+
+fn apply_normalized_risk(func: &mut FunctionMetrics, context: &ScoringContext) {
+    let norm_cog = normalized_value(func.cognitive_complexity as f64, context.caps.cognitive);
+    let norm_cyc = normalized_value(func.cyclomatic_complexity as f64, context.caps.cyclomatic);
+    let norm_churn = normalized_value(func.churn_score, context.caps.churn);
+    let norm_recent_churn =
+        normalized_value(func.churn.windows.d7.score, context.caps.churn_recent);
+    let norm_loc = normalized_value(func.lines_of_code as f64, context.caps.loc);
+    let norm_auth = normalized_value(func.authors_count as f64, context.caps.authors);
+    let norm_fan_in = normalized_value(func.coupling.fan_in as f64, context.caps.fan_in);
+    let coverage_gap = func
+        .coverage
+        .as_ref()
+        .map(|coverage| coverage.risk_coverage_gap);
+    let norm_coverage_gap =
+        coverage_gap.map(|gap| normalized_value(gap, context.caps.coverage_gap));
+
+    func.normalized = Some(NormalizedMetrics {
+        cyclomatic: norm_cyc,
+        churn: norm_churn,
+        churn_recent: norm_recent_churn,
+        cognitive: norm_cog,
+        fan_in: norm_fan_in,
+        loc: norm_loc,
+        authors: norm_auth,
+        coverage_gap: norm_coverage_gap,
+    });
+
+    let base_score = (WEIGHT_COGNITIVE * norm_cog)
+        + (WEIGHT_CYCLOMATIC * norm_cyc)
+        + (WEIGHT_CHURN * norm_churn)
+        + (WEIGHT_CHURN_RECENT * norm_recent_churn)
+        + (WEIGHT_FAN_IN * norm_fan_in)
+        + (WEIGHT_LOC * norm_loc)
+        + (WEIGHT_AUTHORS * norm_auth)
+        + (WEIGHT_COVERAGE_GAP * norm_coverage_gap.unwrap_or(0.0));
+    let nesting_penalty = 1.0 + (func.nesting_depth as f64 / 4.0).powi(2) * 0.20;
+    let fan_in_multiplier = 1.0 + norm_fan_in * 0.25;
+    let final_score = base_score * nesting_penalty * fan_in_multiplier;
+
+    func.risk = Some(RiskMetrics {
+        base_score,
+        nesting_penalty,
+        final_score,
+        level: String::new(),
+        primary_driver: String::new(),
+    });
+}
+
+fn apply_percentiles_and_labels(
+    func: &mut FunctionMetrics,
+    context: &ScoringContext,
+    risk_vals: &[f64],
+    total_funcs: f64,
+) {
+    let Some(risk_score) = func.risk.as_ref().map(|risk| risk.final_score) else {
+        return;
+    };
+    let churn = func.churn_score;
+    let cog = func.cognitive_complexity as f64;
+
+    let risk_pct = percentile_f64(risk_vals, risk_score, total_funcs);
+
+    func.percentile = Some(PercentileMetrics {
+        risk: risk_pct,
+        churn: percentile_f64(&context.churn_vals, churn, total_funcs),
+        cognitive: percentile_u32(&context.cog_vals, cog as u32, total_funcs),
+    });
+
+    let level = match risk_pct {
+        p if p >= THRESHOLD_CRITICAL => "critical",
+        p if p >= THRESHOLD_HIGH => "high",
+        p if p >= THRESHOLD_MEDIUM => "medium",
+        _ => "low",
+    }
+    .to_string();
+
+    if let Some(norm) = &func.normalized {
+        let mut drivers = [
+            ("cognitive", norm.cognitive * WEIGHT_COGNITIVE),
+            ("churn", norm.churn * WEIGHT_CHURN),
+            ("churn_recent", norm.churn_recent * WEIGHT_CHURN_RECENT),
+            ("fan_in", norm.fan_in * WEIGHT_FAN_IN),
+            ("cyclomatic", norm.cyclomatic * WEIGHT_CYCLOMATIC),
+            ("loc", norm.loc * WEIGHT_LOC),
+            ("authors", norm.authors * WEIGHT_AUTHORS),
+            (
+                "coverage_gap",
+                norm.coverage_gap.unwrap_or(0.0) * WEIGHT_COVERAGE_GAP,
+            ),
+        ];
+        drivers.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if let Some(risk) = func.risk.as_mut() {
+            risk.level = level;
+            risk.primary_driver = drivers[0].0.to_string();
+        }
     }
 }
 
