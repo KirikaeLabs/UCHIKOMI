@@ -270,7 +270,7 @@ impl<'a> ComplexityEngine<'a> {
             },
             reachability: ReachabilityMetrics {
                 is_reachable: false,
-                kind: initial_reachability_kind(node),
+                kind: initial_reachability_kind(node, self.source),
             },
             normalized: None,
             risk: None,
@@ -641,7 +641,7 @@ fn call_name(node: Node, source: &str) -> Option<String> {
 }
 
 fn normalize_call_name(text: &str) -> String {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter(|part| !part.is_empty())
         .next_back()
         .unwrap_or_default()
@@ -649,8 +649,10 @@ fn normalize_call_name(text: &str) -> String {
         .to_string()
 }
 
-fn initial_reachability_kind(node: Node) -> String {
-    if is_exported_or_public(node) {
+fn initial_reachability_kind(node: Node, source: &str) -> String {
+    if is_test_entry_point(node, source) {
+        "test_entry".to_string()
+    } else if is_exported_or_public(node) || is_trait_impl_method(node, source) {
         "unreachable_export".to_string()
     } else {
         "unreachable_private".to_string()
@@ -666,6 +668,9 @@ fn is_exported_or_public(node: Node) -> bool {
         ) {
             return true;
         }
+        if has_child_kind(candidate, "visibility_modifier") {
+            return true;
+        }
         if let Some(previous) = candidate.prev_sibling() {
             if previous.kind() == "pub" || previous.kind() == "export" {
                 return true;
@@ -674,6 +679,71 @@ fn is_exported_or_public(node: Node) -> bool {
         current = candidate.parent();
     }
     false
+}
+
+fn is_test_entry_point(node: Node, source: &str) -> bool {
+    attribute_items(node)
+        .into_iter()
+        .any(|attribute| is_rust_test_attribute(attribute, source))
+}
+
+fn attribute_items(node: Node) -> Vec<Node> {
+    let mut attributes = direct_attribute_items(node);
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        if sibling.kind() != "attribute_item" {
+            break;
+        }
+        attributes.push(sibling);
+        previous = sibling.prev_named_sibling();
+    }
+    attributes
+}
+
+fn direct_attribute_items(node: Node) -> Vec<Node> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == "attribute_item")
+        .collect()
+}
+
+fn is_rust_test_attribute(node: Node, source: &str) -> bool {
+    let Ok(text) = node.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    let attribute = text.trim();
+    attribute == "#[test]"
+        || attribute.ends_with("::test]")
+        || attribute.contains("::test(")
+        || attribute.starts_with("#[test(")
+}
+
+fn is_trait_impl_method(node: Node, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if candidate.kind() == "impl_item" {
+            return candidate.child_by_field_name("trait").is_some()
+                || impl_header_declares_trait(candidate, source);
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn impl_header_declares_trait(node: Node, source: &str) -> bool {
+    let body_start = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    source
+        .get(node.start_byte()..body_start)
+        .is_some_and(|header| header.split_whitespace().any(|part| part == "for"))
+}
+
+fn has_child_kind(node: Node, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    let has_child = node.children(&mut cursor).any(|child| child.kind() == kind);
+    has_child
 }
 
 #[cfg(test)]
@@ -698,6 +768,14 @@ mod tests {
             .iter()
             .find(|function| function.name == name)
             .expect("function should exist")
+    }
+
+    #[test]
+    fn normalize_call_name_strips_language_prefixes() {
+        assert_eq!(super::normalize_call_name("Self::analyze"), "analyze");
+        assert_eq!(super::normalize_call_name("git::commit"), "commit");
+        assert_eq!(super::normalize_call_name("this.process"), "process");
+        assert_eq!(super::normalize_call_name("base_function"), "base_function");
     }
 
     #[test]
@@ -823,5 +901,68 @@ mod tests {
         let function = find(&functions, "a");
 
         assert_eq!(function.cognitive_complexity, 3);
+    }
+
+    #[test]
+    fn rust_public_function_is_not_classified_as_private_dead_code() {
+        let functions = analyze_rust(
+            r#"
+            pub fn get_all_file_metrics() {}
+
+            impl GitAnalyzer {
+                pub fn analyze() {}
+            }
+            "#,
+        );
+
+        let function = find(&functions, "get_all_file_metrics");
+        let method = find(&functions, "analyze");
+
+        assert_eq!(function.reachability.kind, "unreachable_export");
+        assert_eq!(method.reachability.kind, "unreachable_export");
+    }
+
+    #[test]
+    fn rust_test_attribute_is_classified_as_test_entry() {
+        let functions = analyze_rust(
+            r#"
+            #[test]
+            fn parses_report() {}
+
+            #[tokio::test]
+            async fn loads_async_report() {}
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn nested_test() {}
+            }
+            "#,
+        );
+
+        let sync_test = find(&functions, "parses_report");
+        let async_test = find(&functions, "loads_async_report");
+        let nested_test = find(&functions, "nested_test");
+
+        assert_eq!(sync_test.reachability.kind, "test_entry");
+        assert_eq!(async_test.reachability.kind, "test_entry");
+        assert_eq!(nested_test.reachability.kind, "test_entry");
+    }
+
+    #[test]
+    fn rust_trait_impl_method_is_not_classified_as_private_dead_code() {
+        let functions = analyze_rust(
+            r#"
+            impl std::fmt::Display for Report {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "report")
+                }
+            }
+            "#,
+        );
+
+        let function = find(&functions, "fmt");
+
+        assert_eq!(function.reachability.kind, "unreachable_export");
     }
 }

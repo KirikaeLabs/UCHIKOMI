@@ -814,18 +814,26 @@ fn apply_coupling_metrics(
 
 fn mark_reachable_if_needed(function: &mut FunctionMetrics, reachable: bool) {
     let public_or_exported = function.reachability.kind == "unreachable_export";
-    if reachable || public_or_exported || function.name == "main" {
+    let test_entry = function.reachability.kind == "test_entry" || is_test_file(function);
+    if reachable || public_or_exported || test_entry || function.name == "main" {
         function.reachability.is_reachable = true;
-        function.reachability.kind = reachability_kind(function);
+        function.reachability.kind = if test_entry {
+            "test_only".to_string()
+        } else {
+            reachability_kind(function)
+        };
     }
 }
 
-fn reachability_kind(function: &FunctionMetrics) -> String {
-    if function.file.contains("/tests/")
+fn is_test_file(function: &FunctionMetrics) -> bool {
+    function.file.contains("/tests/")
         || function.file.ends_with("_test.rs")
         || function.file.ends_with(".test.ts")
         || function.file.ends_with(".spec.ts")
-    {
+}
+
+fn reachability_kind(function: &FunctionMetrics) -> String {
+    if is_test_file(function) {
         "test_only".to_string()
     } else {
         "reachable".to_string()

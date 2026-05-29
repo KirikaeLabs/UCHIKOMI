@@ -524,3 +524,43 @@ fn analyzes_rust_and_c_repository() {
     assert_eq!(c_func.name, "add");
     assert_eq!(c_func.cyclomatic_complexity, 2);
 }
+
+#[test]
+fn treats_rust_test_files_as_test_only_reachable() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+
+    let tests_dir = repo_path.join("tests");
+    fs::create_dir_all(&tests_dir).expect("tests dir should be created");
+    fs::write(
+        tests_dir.join("integration.rs"),
+        r#"
+        #[test]
+        fn verifies_public_behavior() {
+            assert_eq!(1 + 1, 2);
+        }
+        "#,
+    )
+    .expect("test file should be written");
+
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    let function = report
+        .functions
+        .iter()
+        .find(|function| function.name == "verifies_public_behavior")
+        .expect("test function should exist");
+
+    assert!(function.reachability.is_reachable);
+    assert_eq!(function.reachability.kind, "test_only");
+    assert!(report
+        .summary
+        .project_stats
+        .dead_code
+        .functions
+        .iter()
+        .all(|function| function.name != "verifies_public_behavior"));
+}
