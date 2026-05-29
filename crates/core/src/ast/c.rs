@@ -1,4 +1,4 @@
-use super::LanguageSupport;
+use super::{CognitiveComplexity, LanguageSupport};
 use tree_sitter::{Language, Node};
 
 pub struct CSupport;
@@ -30,6 +30,19 @@ impl LanguageSupport for CSupport {
         )
     }
 
+    fn cognitive_complexity(&self, node: Node) -> CognitiveComplexity {
+        match node.kind() {
+            "if_statement"
+            | "for_statement"
+            | "while_statement"
+            | "do_statement"
+            | "conditional_expression" => CognitiveComplexity::Nesting,
+            "switch_statement" => CognitiveComplexity::Structural,
+            "binary_expression" => CognitiveComplexity::Logical,
+            _ => CognitiveComplexity::None,
+        }
+    }
+
     fn extract_name(&self, node: Node, source: &str) -> String {
         let Some(declarator) = first_child_of_kind(node, "function_declarator") else {
             return "<anonymous>".to_string();
@@ -44,7 +57,9 @@ impl LanguageSupport for CSupport {
 
 fn first_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
-    let child = node.children(&mut cursor).find(|child| child.kind() == kind);
+    let child = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == kind);
     child
 }
 

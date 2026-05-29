@@ -1,4 +1,4 @@
-use super::LanguageSupport;
+use super::{CognitiveComplexity, LanguageSupport};
 use tree_sitter::{Language, Node};
 
 pub struct RustSupport;
@@ -29,6 +29,16 @@ impl LanguageSupport for RustSupport {
                 | "match_pattern"
                 | "?"
         )
+    }
+
+    fn cognitive_complexity(&self, node: Node) -> CognitiveComplexity {
+        match node.kind() {
+            "if_expression" | "if_let_expression" | "for_expression" | "while_expression"
+            | "loop_expression" => CognitiveComplexity::Nesting,
+            "match_expression" => CognitiveComplexity::Structural,
+            "binary_expression" => CognitiveComplexity::Logical,
+            _ => CognitiveComplexity::None,
+        }
     }
 
     fn extract_name(&self, node: Node, source: &str) -> String {

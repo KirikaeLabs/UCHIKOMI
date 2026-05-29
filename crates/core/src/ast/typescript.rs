@@ -1,4 +1,4 @@
-use super::LanguageSupport;
+use super::{CognitiveComplexity, LanguageSupport};
 use tree_sitter::{Language, Node};
 use tree_sitter_typescript::{language_tsx, language_typescript};
 
@@ -41,6 +41,16 @@ impl LanguageSupport for TypeScriptSupport {
             node.kind(),
             "if" | "for" | "while" | "do" | "case" | "catch" | "&&" | "||" | "?"
         )
+    }
+
+    fn cognitive_complexity(&self, node: Node) -> CognitiveComplexity {
+        match node.kind() {
+            "if_statement" | "for_statement" | "while_statement" | "do_statement"
+            | "catch_clause" | "ternary_expression" => CognitiveComplexity::Nesting,
+            "switch_statement" => CognitiveComplexity::Structural,
+            "binary_expression" => CognitiveComplexity::Logical,
+            _ => CognitiveComplexity::None,
+        }
     }
 
     fn extract_name(&self, node: Node, source: &str) -> String {

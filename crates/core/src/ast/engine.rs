@@ -3,7 +3,7 @@ use anyhow::Result;
 use tree_sitter::Node;
 use xxhash_rust::xxh3::xxh3_128;
 
-use super::LanguageSupport;
+use super::{CognitiveComplexity, LanguageSupport};
 
 pub struct ComplexityEngine<'a> {
     source: &'a str,
@@ -58,11 +58,7 @@ impl<'a> ComplexityEngine<'a> {
         let mut functions = Vec::new();
         let mut traversal_stack = vec![TraversalEvent::Enter(root_node, 0, None)];
 
-        self.drain_traversal_stack(
-            &mut function_stack,
-            &mut functions,
-            &mut traversal_stack,
-        );
+        self.drain_traversal_stack(&mut function_stack, &mut functions, &mut traversal_stack);
 
         Ok(functions.into_iter().flatten().collect())
     }
@@ -201,14 +197,17 @@ impl<'a> ComplexityEngine<'a> {
         last_op: Option<&'static str>,
         state: &mut NodeState,
     ) {
-        let kind = node.kind();
-        if is_nesting_complexity_node(kind) {
-            increment_nesting_cognitive(node, kind, function, active_depth, state);
-            return;
-        }
-
-        if kind == "binary_expression" {
-            increment_logical_cognitive(node, function, last_op, state);
+        match self.support.cognitive_complexity(node) {
+            CognitiveComplexity::None => {}
+            CognitiveComplexity::Logical => {
+                increment_logical_cognitive(node, function, last_op, state);
+            }
+            CognitiveComplexity::Structural => {
+                increment_structural_cognitive(node, function, active_depth);
+            }
+            CognitiveComplexity::Nesting => {
+                increment_nesting_cognitive(node, function, active_depth, state);
+            }
         }
     }
 
@@ -219,10 +218,10 @@ impl<'a> ComplexityEngine<'a> {
         child_depth: u32,
         last_op: Option<&'static str>,
     ) {
-        let mut cursor = node.walk();
-        let children = node.children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
-            traversal_stack.push(TraversalEvent::Enter(child, child_depth, last_op));
+        for index in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(index) {
+                traversal_stack.push(TraversalEvent::Enter(child, child_depth, last_op));
+            }
         }
     }
 
@@ -340,7 +339,7 @@ impl<'a> ComplexityEngine<'a> {
         }
 
         while let Some(current) = stack.pop() {
-            if current != node && self.support.is_function(current) {
+            if self.should_skip_body_node(current, node) {
                 continue;
             }
 
@@ -348,12 +347,7 @@ impl<'a> ComplexityEngine<'a> {
             if is_executable_node(kind) {
                 executable_statements += 1;
             }
-            if is_identifier_node(kind) {
-                if let Ok(identifier) = current.utf8_text(self.source.as_bytes()) {
-                    identifier_total += identifier.len();
-                    identifier_count += 1;
-                }
-            }
+            self.add_identifier_quality(current, &mut identifier_total, &mut identifier_count);
 
             let mut cursor = current.walk();
             for child in current.children(&mut cursor) {
@@ -370,6 +364,26 @@ impl<'a> ComplexityEngine<'a> {
         BodyTraversalQuality {
             executable_statements,
             identifier_verbosity,
+        }
+    }
+
+    fn should_skip_body_node(&self, current: Node, root: Node) -> bool {
+        current != root && self.support.is_function(current)
+    }
+
+    fn add_identifier_quality(
+        &self,
+        node: Node,
+        identifier_total: &mut usize,
+        identifier_count: &mut usize,
+    ) {
+        if !is_identifier_node(node.kind()) {
+            return;
+        }
+
+        if let Ok(identifier) = node.utf8_text(self.source.as_bytes()) {
+            *identifier_total += identifier.len();
+            *identifier_count += 1;
         }
     }
 
@@ -391,17 +405,24 @@ struct BodyTraversalQuality {
     identifier_verbosity: f64,
 }
 
+fn increment_structural_cognitive(node: Node, function: &mut FunctionState, active_depth: u32) {
+    if is_else_if(node) {
+        function.cognitive += 1;
+    } else {
+        function.cognitive += 1 + active_depth;
+    }
+}
+
 fn increment_nesting_cognitive(
     node: Node,
-    kind: &str,
     function: &mut FunctionState,
     active_depth: u32,
     state: &mut NodeState,
 ) {
-    if is_else_if(node, kind) {
+    if is_else_if(node) {
         function.cognitive += 1;
     } else {
-        function.cognitive += 1 + active_depth;
+        increment_structural_cognitive(node, function, active_depth);
         state.child_depth += 1;
     }
 }
@@ -432,24 +453,8 @@ fn logical_operator(node: Node) -> Option<&'static str> {
     None
 }
 
-fn is_nesting_complexity_node(kind: &str) -> bool {
-    matches!(
-        kind,
-        "if_statement"
-            | "for_statement"
-            | "while_statement"
-            | "do_statement"
-            | "switch_statement"
-            | "catch_clause"
-            | "ternary_expression"
-            | "if_expression"
-            | "match_expression"
-            | "match_arm"
-    )
-}
-
-fn is_else_if(node: Node, kind: &str) -> bool {
-    kind == "if_statement"
+fn is_else_if(node: Node) -> bool {
+    node.kind() == "if_statement"
         && node
             .parent()
             .is_some_and(|parent| parent.kind() == "else_clause")
@@ -674,12 +679,18 @@ fn is_exported_or_public(node: Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::parser::AstParser;
+    use crate::ast::rust::RustSupport;
     use crate::ast::typescript::TypeScriptSupport;
     use crate::metrics::FunctionMetrics;
 
-    fn analyze(source: &str) -> Vec<FunctionMetrics> {
+    fn analyze_typescript(source: &str) -> Vec<FunctionMetrics> {
         let support = TypeScriptSupport::new(false);
         AstParser::analyze_source(source, "file.ts", &support).expect("source should parse")
+    }
+
+    fn analyze_rust(source: &str) -> Vec<FunctionMetrics> {
+        let support = RustSupport;
+        AstParser::analyze_source(source, "file.rs", &support).expect("source should parse")
     }
 
     fn find<'a>(functions: &'a [FunctionMetrics], name: &str) -> &'a FunctionMetrics {
@@ -691,7 +702,7 @@ mod tests {
 
     #[test]
     fn simple_function_counts_branch_complexity() {
-        let functions = analyze(
+        let functions = analyze_typescript(
             r#"
             function a() {
                 if (x) {}
@@ -710,7 +721,7 @@ mod tests {
 
     #[test]
     fn nested_function_does_not_inflate_parent_complexity() {
-        let functions = analyze(
+        let functions = analyze_typescript(
             r#"
             function outer() {
                 function inner() {
@@ -736,7 +747,7 @@ mod tests {
 
     #[test]
     fn arrow_function_counts_branch_complexity() {
-        let functions = analyze(
+        let functions = analyze_typescript(
             r#"
             const f = () => {
                 if (x) {}
@@ -751,5 +762,66 @@ mod tests {
         assert_eq!(function.nesting_depth, 1);
         assert!(function.lines_of_code >= 3);
         assert!(function.lines_of_code <= 5);
+    }
+
+    #[test]
+    fn rust_flat_match_counts_once() {
+        let functions = analyze_rust(
+            r#"
+            fn a(x: u8) -> u8 {
+                match x {
+                    1 => 1,
+                    2 => 2,
+                    _ => 0,
+                }
+            }
+            "#,
+        );
+
+        let function = find(&functions, "a");
+
+        assert_eq!(function.cognitive_complexity, 1);
+    }
+
+    #[test]
+    fn rust_match_arm_does_not_add_nesting_penalty_to_nested_logic() {
+        let functions = analyze_rust(
+            r#"
+            fn a(x: u8, cond: bool) {
+                match x {
+                    1 => {
+                        if cond {
+                            foo();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "#,
+        );
+
+        let function = find(&functions, "a");
+
+        assert_eq!(function.cognitive_complexity, 2);
+    }
+
+    #[test]
+    fn rust_match_nested_inside_if_pays_outer_nesting_penalty() {
+        let functions = analyze_rust(
+            r#"
+            fn a(x: u8, cond: bool) {
+                if cond {
+                    match x {
+                        1 => {}
+                        _ => {}
+                    }
+                }
+            }
+            "#,
+        );
+
+        let function = find(&functions, "a");
+
+        assert_eq!(function.cognitive_complexity, 3);
     }
 }

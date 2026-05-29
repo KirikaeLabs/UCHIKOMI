@@ -351,6 +351,18 @@ fn reports_temporal_churn_coupling_and_reachability() {
         analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
     assert!(report.summary.coverage.is_none());
     assert!(report.summary.project_stats.dead_code.unreachable_functions >= 1);
+    assert!(report
+        .summary
+        .project_stats
+        .dead_code
+        .functions
+        .iter()
+        .any(|function| {
+            function.name == "unused"
+                && function.file == "src/index.ts"
+                && function.kind == "unreachable_private"
+                && function.safe_to_delete
+        }));
 
     let entry = report
         .functions

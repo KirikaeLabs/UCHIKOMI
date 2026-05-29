@@ -174,6 +174,18 @@ pub struct DeadCodeStats {
     pub unreachable_functions: usize,
     pub unreachable_loc: u32,
     pub safe_to_delete: usize,
+    pub functions: Vec<DeadCodeFunction>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeadCodeFunction {
+    pub id: String,
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub lines_of_code: u32,
+    pub kind: String,
+    pub safe_to_delete: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

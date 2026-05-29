@@ -563,18 +563,32 @@ fn author_contributions(git_cache: &HashMap<String, GitCacheEntry>) -> HashMap<S
     let mut author_contributions: HashMap<String, usize> = HashMap::new();
     for entry in git_cache.values() {
         if entry.line_changes.is_empty() {
-            for author in &entry.authors {
-                *author_contributions.entry(author.clone()).or_default() += entry.times_modified;
-            }
+            add_file_author_contributions(&mut author_contributions, entry);
         } else {
-            for change in &entry.line_changes {
-                *author_contributions
-                    .entry(change.author.clone())
-                    .or_default() += 1;
-            }
+            add_line_author_contributions(&mut author_contributions, entry);
         }
     }
     author_contributions
+}
+
+fn add_file_author_contributions(
+    author_contributions: &mut HashMap<String, usize>,
+    entry: &GitCacheEntry,
+) {
+    for author in &entry.authors {
+        *author_contributions.entry(author.clone()).or_default() += entry.times_modified;
+    }
+}
+
+fn add_line_author_contributions(
+    author_contributions: &mut HashMap<String, usize>,
+    entry: &GitCacheEntry,
+) {
+    for change in &entry.line_changes {
+        *author_contributions
+            .entry(change.author.clone())
+            .or_default() += 1;
+    }
 }
 
 fn bus_factor(author_contributions: HashMap<String, usize>) -> usize {
@@ -644,6 +658,19 @@ fn build_dead_code_stats(functions: &[FunctionMetrics]) -> metrics::DeadCodeStat
         .iter()
         .filter(|function| !function.reachability.is_reachable)
         .collect::<Vec<_>>();
+    let functions = unreachable
+        .iter()
+        .map(|function| metrics::DeadCodeFunction {
+            id: function.id.clone(),
+            name: function.name.clone(),
+            file: function.file.clone(),
+            line: function.line,
+            lines_of_code: function.lines_of_code,
+            kind: function.reachability.kind.clone(),
+            safe_to_delete: function.reachability.kind == "unreachable_private",
+        })
+        .collect();
+
     metrics::DeadCodeStats {
         unreachable_functions: unreachable.len(),
         unreachable_loc: unreachable
@@ -654,6 +681,7 @@ fn build_dead_code_stats(functions: &[FunctionMetrics]) -> metrics::DeadCodeStat
             .iter()
             .filter(|function| function.reachability.kind == "unreachable_private")
             .count(),
+        functions,
     }
 }
 
@@ -729,18 +757,38 @@ fn collect_coupling_links(
             let Some(targets) = by_name.get(&callee_name) else {
                 continue;
             };
-            for &callee_index in targets {
-                if callee_index == caller_index {
-                    continue;
-                }
-                reachable[callee_index] = true;
-                callers_by_index[callee_index].push(caller_ref.clone());
-                callees_by_index[caller_index].push(function_ref(&functions[callee_index]));
-            }
+            collect_callee_targets(
+                functions,
+                caller_index,
+                &caller_ref,
+                targets,
+                &mut callers_by_index,
+                &mut callees_by_index,
+                &mut reachable,
+            );
         }
     }
 
     (callers_by_index, callees_by_index, reachable)
+}
+
+fn collect_callee_targets(
+    functions: &[FunctionMetrics],
+    caller_index: usize,
+    caller_ref: &str,
+    targets: &[usize],
+    callers_by_index: &mut [Vec<String>],
+    callees_by_index: &mut [Vec<String>],
+    reachable: &mut [bool],
+) {
+    for &callee_index in targets {
+        if callee_index == caller_index {
+            continue;
+        }
+        reachable[callee_index] = true;
+        callers_by_index[callee_index].push(caller_ref.to_string());
+        callees_by_index[caller_index].push(function_ref(&functions[callee_index]));
+    }
 }
 
 fn apply_coupling_metrics(
@@ -794,50 +842,67 @@ fn apply_coverage(functions: &mut [FunctionMetrics], coverage: Option<&CoverageI
             continue;
         };
 
-        let covered_lines = file_coverage
-            .lines
-            .iter()
-            .filter(|(line, hits)| {
-                **line >= function.line && **line <= function.end_line && **hits > 0
-            })
-            .count();
-        let relevant_lines = file_coverage
-            .lines
-            .keys()
-            .filter(|line| **line >= function.line && **line <= function.end_line)
-            .count();
-        let line_coverage = if relevant_lines == 0 {
-            0.0
-        } else {
-            covered_lines as f64 / relevant_lines as f64
-        };
-
-        let branch_total = file_coverage
-            .branches
-            .iter()
-            .filter(|branch| branch.line >= function.line && branch.line <= function.end_line)
-            .count();
-        let branch_coverage = if branch_total == 0 {
-            None
-        } else {
-            let branch_covered = file_coverage
-                .branches
-                .iter()
-                .filter(|branch| {
-                    branch.line >= function.line && branch.line <= function.end_line && branch.taken
-                })
-                .count();
-            Some(branch_covered as f64 / branch_total as f64)
-        };
-
-        function.coverage = Some(metrics::CoverageMetrics {
-            available: true,
-            line_coverage,
-            branch_coverage,
-            covered_by: Vec::new(),
-            risk_coverage_gap: 1.0 - line_coverage,
-        });
+        function.coverage = Some(function_coverage(function, file_coverage));
     }
+}
+
+fn function_coverage(
+    function: &FunctionMetrics,
+    file_coverage: &FileCoverageData,
+) -> metrics::CoverageMetrics {
+    let line_coverage = line_coverage(function, file_coverage);
+    metrics::CoverageMetrics {
+        available: true,
+        line_coverage,
+        branch_coverage: branch_coverage(function, file_coverage),
+        covered_by: Vec::new(),
+        risk_coverage_gap: 1.0 - line_coverage,
+    }
+}
+
+fn line_coverage(function: &FunctionMetrics, file_coverage: &FileCoverageData) -> f64 {
+    let covered_lines = file_coverage
+        .lines
+        .iter()
+        .filter(|(line, hits)| {
+            **line >= function.line && **line <= function.end_line && **hits > 0
+        })
+        .count();
+    let relevant_lines = file_coverage
+        .lines
+        .keys()
+        .filter(|line| **line >= function.line && **line <= function.end_line)
+        .count();
+
+    if relevant_lines == 0 {
+        0.0
+    } else {
+        covered_lines as f64 / relevant_lines as f64
+    }
+}
+
+fn branch_coverage(
+    function: &FunctionMetrics,
+    file_coverage: &FileCoverageData,
+) -> Option<f64> {
+    let branch_total = file_coverage
+        .branches
+        .iter()
+        .filter(|branch| branch.line >= function.line && branch.line <= function.end_line)
+        .count();
+
+    if branch_total == 0 {
+        return None;
+    }
+
+    let branch_covered = file_coverage
+        .branches
+        .iter()
+        .filter(|branch| {
+            branch.line >= function.line && branch.line <= function.end_line && branch.taken
+        })
+        .count();
+    Some(branch_covered as f64 / branch_total as f64)
 }
 
 fn update_coverage_gaps(functions: &mut [FunctionMetrics]) {
@@ -1181,40 +1246,68 @@ fn parse_lcov(content: &str, repo_path: &Path) -> Result<CoverageIndex> {
 
     for line in content.lines() {
         if let Some(path) = line.strip_prefix("SF:") {
-            if let Some(file) = current_file.replace(normalize_coverage_path(path, repo_path)) {
-                index.files.insert(file, current_data);
-                current_data = FileCoverageData::default();
-            }
+            start_coverage_record(
+                &mut index,
+                &mut current_file,
+                &mut current_data,
+                path,
+                repo_path,
+            );
             continue;
         }
 
         if let Some(data) = line.strip_prefix("DA:") {
-            if let Some((line_no, hits)) = parse_line_coverage(data) {
-                current_data.lines.insert(line_no, hits);
-            }
+            add_line_coverage(&mut current_data, data);
             continue;
         }
 
         if let Some(data) = line.strip_prefix("BRDA:") {
-            if let Some(branch) = parse_branch_coverage(data) {
-                current_data.branches.push(branch);
-            }
+            add_branch_coverage(&mut current_data, data);
             continue;
         }
 
         if line == "end_of_record" {
-            if let Some(file) = current_file.take() {
-                index.files.insert(file, current_data);
-                current_data = FileCoverageData::default();
-            }
+            finish_coverage_record(&mut index, &mut current_file, &mut current_data);
         }
     }
 
-    if let Some(file) = current_file {
-        index.files.insert(file, current_data);
-    }
+    finish_coverage_record(&mut index, &mut current_file, &mut current_data);
 
     Ok(index)
+}
+
+fn start_coverage_record(
+    index: &mut CoverageIndex,
+    current_file: &mut Option<String>,
+    current_data: &mut FileCoverageData,
+    path: &str,
+    repo_path: &Path,
+) {
+    if let Some(file) = current_file.replace(normalize_coverage_path(path, repo_path)) {
+        index.files.insert(file, std::mem::take(current_data));
+    }
+}
+
+fn finish_coverage_record(
+    index: &mut CoverageIndex,
+    current_file: &mut Option<String>,
+    current_data: &mut FileCoverageData,
+) {
+    if let Some(file) = current_file.take() {
+        index.files.insert(file, std::mem::take(current_data));
+    }
+}
+
+fn add_line_coverage(current_data: &mut FileCoverageData, data: &str) {
+    if let Some((line_no, hits)) = parse_line_coverage(data) {
+        current_data.lines.insert(line_no, hits);
+    }
+}
+
+fn add_branch_coverage(current_data: &mut FileCoverageData, data: &str) {
+    if let Some(branch) = parse_branch_coverage(data) {
+        current_data.branches.push(branch);
+    }
 }
 
 fn normalize_coverage_path(path: &str, repo_path: &Path) -> String {
