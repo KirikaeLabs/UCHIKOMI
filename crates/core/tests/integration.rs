@@ -1,10 +1,10 @@
-use uchikomi::analyze_repository;
-use uchikomi::metrics::AnalysisStatus;
 use git2::{Repository, Signature};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use uchikomi::analyze_repository;
+use uchikomi::metrics::AnalysisStatus;
 
 fn assert_close(actual: f64, expected: f64) {
     assert!(

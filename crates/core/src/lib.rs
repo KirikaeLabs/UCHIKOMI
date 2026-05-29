@@ -492,7 +492,9 @@ impl SortKey {
     fn compare(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
         match self {
             Self::Location => location_order(a, b),
-            _ => self.metric_ordering(a, b).then_with(|| location_order(a, b)),
+            _ => self
+                .metric_ordering(a, b)
+                .then_with(|| location_order(a, b)),
         }
     }
 
@@ -791,11 +793,7 @@ fn collect_callee_targets(
     }
 }
 
-fn apply_coupling_metrics(
-    function: &mut FunctionMetrics,
-    callers: &[String],
-    callees: &[String],
-) {
+fn apply_coupling_metrics(function: &mut FunctionMetrics, callers: &[String], callees: &[String]) {
     let fan_in = callers.len();
     let fan_out = callees.len();
     let denominator = fan_in + fan_out;
@@ -872,9 +870,7 @@ fn line_coverage(function: &FunctionMetrics, file_coverage: &FileCoverageData) -
     let covered_lines = file_coverage
         .lines
         .iter()
-        .filter(|(line, hits)| {
-            **line >= function.line && **line <= function.end_line && **hits > 0
-        })
+        .filter(|(line, hits)| **line >= function.line && **line <= function.end_line && **hits > 0)
         .count();
     let relevant_lines = file_coverage
         .lines
@@ -889,10 +885,7 @@ fn line_coverage(function: &FunctionMetrics, file_coverage: &FileCoverageData) -
     }
 }
 
-fn branch_coverage(
-    function: &FunctionMetrics,
-    file_coverage: &FileCoverageData,
-) -> Option<f64> {
+fn branch_coverage(function: &FunctionMetrics, file_coverage: &FileCoverageData) -> Option<f64> {
     let branch_total = file_coverage
         .branches
         .iter()

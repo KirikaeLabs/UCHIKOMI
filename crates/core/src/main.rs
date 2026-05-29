@@ -1,9 +1,9 @@
 use anyhow::Result;
-use uchikomi::analyze_repository_with_authors;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use uchikomi::analyze_repository_with_authors;
 
 #[derive(Parser, Debug)]
 #[command(name = "uchikomi")]
