@@ -1,5 +1,5 @@
-use churnlens::analyze_repository;
-use churnlens::metrics::AnalysisStatus;
+use uchikomi::analyze_repository;
+use uchikomi::metrics::AnalysisStatus;
 use git2::{Repository, Signature};
 use std::fs;
 use std::path::Path;
@@ -301,7 +301,7 @@ fn honors_custom_bug_fix_patterns() {
     let temp_dir = tempfile::tempdir().expect("temp dir should be created");
     let repo_path = temp_dir.path();
     fs::write(
-        repo_path.join("churnlens.toml"),
+        repo_path.join("uchikomi.toml"),
         r#"
         [git]
         bug_fix_patterns = ["CL-[0-9]+"]

@@ -61,12 +61,12 @@ struct RepoContext {
     cache: AnalysisCache,
     cache_loaded: bool,
     repo_path_abs: std::path::PathBuf,
-    config: ChurnLensConfig,
+    config: UchikomiConfig,
     coverage: Option<CoverageIndex>,
 }
 
 #[derive(Default, Deserialize)]
-struct ChurnLensConfig {
+struct UchikomiConfig {
     #[serde(default)]
     git: GitConfig,
 }
@@ -319,7 +319,7 @@ fn empty_analysis_report(
 }
 
 fn configured_bug_fix_patterns(
-    config: &ChurnLensConfig,
+    config: &UchikomiConfig,
     warnings: &mut Vec<AnalysisWarning>,
 ) -> BugFixPatterns {
     match BugFixPatterns::from_patterns(&config.git.bug_fix_patterns) {
@@ -1190,19 +1190,19 @@ fn analysis_cache_has_entries(cache: &AnalysisCache) -> bool {
     !cache.files.is_empty() || !cache.git_cache.is_empty() || cache.last_commit_oid.is_some()
 }
 
-fn load_config(repo_path: &Path, warnings: &mut Vec<AnalysisWarning>) -> ChurnLensConfig {
-    let config_path = repo_path.join("churnlens.toml");
+fn load_config(repo_path: &Path, warnings: &mut Vec<AnalysisWarning>) -> UchikomiConfig {
+    let config_path = repo_path.join("uchikomi.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return ChurnLensConfig::default();
+            return UchikomiConfig::default();
         }
         Err(err) => {
             warnings.push(AnalysisWarning {
                 code: "config_read_failed".to_string(),
                 message: format!("Failed to read {}: {err}", config_path.display()),
             });
-            return ChurnLensConfig::default();
+            return UchikomiConfig::default();
         }
     };
 
@@ -1213,7 +1213,7 @@ fn load_config(repo_path: &Path, warnings: &mut Vec<AnalysisWarning>) -> ChurnLe
                 code: "config_parse_failed".to_string(),
                 message: format!("Failed to parse {}: {err}", config_path.display()),
             });
-            ChurnLensConfig::default()
+            UchikomiConfig::default()
         }
     }
 }

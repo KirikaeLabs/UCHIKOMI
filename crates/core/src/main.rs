@@ -1,12 +1,12 @@
 use anyhow::Result;
-use churnlens::analyze_repository_with_authors;
+use uchikomi::analyze_repository_with_authors;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "churnlens")]
+#[command(name = "uchikomi")]
 #[command(about = "Analyze code complexity and churn", long_about = None)]
 struct Args {
     /// Path to repository

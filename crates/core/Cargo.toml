@@ -1,5 +1,5 @@
 [package]
-name = "churnlens"
+name = "uchikomi"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,7 +12,7 @@ categories.workspace = true
 keywords.workspace = true
 
 [[bin]]
-name = "churnlens"
+name = "uchikomi"
 path = "src/main.rs"
 
 [dependencies]

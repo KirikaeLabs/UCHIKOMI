@@ -64,7 +64,7 @@ pub struct CacheManager {
 
 impl CacheManager {
     pub fn new(repo_path: &Path) -> Result<Self> {
-        let cache_dir = repo_path.join(".churnlens");
+        let cache_dir = repo_path.join(".uchikomi");
         fs::create_dir_all(&cache_dir)?;
         Ok(Self {
             cache_path: cache_dir.join("cache.bin"),

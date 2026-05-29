@@ -591,7 +591,11 @@ fn is_executable_node(kind: &str) -> bool {
 fn is_identifier_node(kind: &str) -> bool {
     matches!(
         kind,
-        "identifier" | "property_identifier" | "field_identifier" | "type_identifier"
+        "identifier"
+            | "property_identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "scoped_identifier"
     )
 }
 
@@ -606,6 +610,14 @@ fn collect_call_names(node: Node, source: &str, support: &dyn LanguageSupport) -
     while let Some(current) = stack.pop() {
         if current != node && support.is_function(current) {
             continue;
+        }
+        if is_identifier_node(current.kind()) {
+            if let Ok(text) = current.utf8_text(source.as_bytes()) {
+                let name = normalize_call_name(text);
+                if !name.is_empty() {
+                    calls.push(name);
+                }
+            }
         }
         if is_call_node(current.kind()) {
             if let Some(name) = call_name(current, source) {
@@ -645,8 +657,22 @@ fn normalize_call_name(text: &str) -> String {
         .filter(|part| !part.is_empty())
         .next_back()
         .unwrap_or_default()
-        .trim_matches(':')
         .to_string()
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::normalize_call_name;
+
+    #[test]
+    fn test_normalize_call_name() {
+        assert_eq!(normalize_call_name("Self::analyze"), "analyze");
+        assert_eq!(normalize_call_name("git::commit::push"), "push");
+        assert_eq!(normalize_call_name("this.process"), "process");
+        assert_eq!(normalize_call_name("base_function"), "base_function");
+        assert_eq!(normalize_call_name("Option::<T>::unwrap"), "unwrap");
+        assert_eq!(normalize_call_name("ptr->method"), "method");
+    }
 }
 
 fn initial_reachability_kind(node: Node, source: &str) -> String {
@@ -964,5 +990,28 @@ mod tests {
         let function = find(&functions, "fmt");
 
         assert_eq!(function.reachability.kind, "unreachable_export");
+    }
+
+    #[test]
+    fn rust_callback_identifier_is_collected_as_callee() {
+        let functions = analyze_rust(
+            r#"
+            pub fn caller(value: Result<(), ()>) -> Result<(), String> {
+                value.map_err(callback)
+            }
+
+            fn callback(_: ()) -> String {
+                "error".to_string()
+            }
+            "#,
+        );
+
+        let caller = find(&functions, "caller");
+
+        assert!(caller
+            .coupling
+            .callees
+            .iter()
+            .any(|name| name == "callback"));
     }
 }
