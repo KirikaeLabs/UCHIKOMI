@@ -62,7 +62,7 @@ Uchikomi employs a stack-based, non-recursive tree traversal engine (`Complexity
 
 #### Language Targets & Complexity Rules
 
-* **Rust (`rust.rs`)**: Targets `function_item` and `method_declaration`. Evaluates complexity via `if_expression`, `match_expression`, `for_expression`, `while_expression`, `match_arm`, and the `?` operator.
+* **Rust (`rust.rs`)**: Targets `function_item` and `method_declaration`. Evaluates complexity via `if_expression`, `if_let_expression`, `match_expression`, `for_expression`, `while_expression`, `loop_expression`, `match_arm`, `match_pattern`, and the `?` operator.
 * **TypeScript / JavaScript (`typescript.rs`)**: Targets `function_declaration`, `arrow_function`, and `method_definition`. Evaluates complexity via `if`, `for`, `while`, `do`, `case`, `catch`, `&&`, `||`, and `?`. Implements name-resolution heuristics for anonymous functions assigned to variables.
 * **C (`c.rs`)**: Targets `function_definition` and evaluates standard C control flow structures.
 
@@ -103,9 +103,9 @@ The engine derives a multi-factored risk profile:
 
 $$\mathrm{FinalRisk} = \mathrm{BaseScore} \times \mathrm{NestingPenalty} \times \mathrm{FanInMultiplier}$$
 
-* **Base Score Weights:** Cognitive Complexity (35%), Historical Churn (30%), Cyclomatic Complexity (15%), Lines of Code (10%), Unique Authors (10%).
-* **Nesting Penalty:** $\displaystyle 1.0 + \left(\frac{\text{max\\_depth}}{4}\right)^2 \times 0.20$
-* **Fan-In Multiplier:** $1.0 + (\text{normalized\\_fan\\_in} \times 0.25)$
+* **Base Score Weights:** Cognitive Complexity (30%), Historical Churn (20%), Recent Churn (15%), Cyclomatic Complexity (10%), Fan-In (10%), Lines of Code (5%), Unique Authors (5%), and Coverage Gap (5%).
+* **Nesting Penalty:** $\displaystyle 1.0 + \left(\frac{\text{max\_depth}}{4}\right)^2 \times 0.20$
+* **Fan-In Multiplier:** $1.0 + (\text{normalized\_fan\_in} \times 0.25)$
 * **Primary Driver:** The telemetry object identifies the exact metric that contributed most heavily to the `BaseScore` to give downstream agents a clear target.
 
 ---
@@ -116,12 +116,25 @@ Uchikomi produces a single, machine-consumable JSON document optimized for pipel
 
 ```json
 {
-  "schema_version": "string",
+  "schema_version": "0.4.0",
   "analysis": {
     "repository": "string (path)",
     "commit": "string",
     "branch": "string",
     "timestamp": "RFC3339"
+  },
+  "scoring_policy": {
+    "weights": {
+      "cognitive": 0.30,
+      "cyclomatic": 0.10,
+      "churn": 0.20,
+      "churn_recent": 0.15,
+      "fan_in": 0.10,
+      "loc": 0.05,
+      "authors": 0.05,
+      "coverage_gap": 0.05
+    },
+    "thresholds": { "critical": 95.0, "high": 80.0, "medium": 50.0 }
   },
   "summary": {
     "total_functions": integer,
@@ -176,7 +189,13 @@ Uchikomi produces a single, machine-consumable JSON document optimized for pipel
       "coupling": { "fan_in": 3, "fan_out": 5, "instability": 0.625 },
       "reachability": { "kind": "exported" },
       "churn_score": 4.2,
-      "normalized": { "cognitive": 0.32, "churn": 0.45 },
+      "normalized": {
+        "cognitive": 0.32,
+        "churn": 0.45,
+        "churn_recent": 0.12,
+        "fan_in": 0.08,
+        "coverage_gap": 0.05
+      },
       "risk": { "base_score": 0.38, "nesting_penalty": 1.05, "final_score": 0.40, "primary_driver": "cognitive" },
       "percentile": { "risk": 84.5, "churn": 72.1, "cognitive": 91.0 }
     }
