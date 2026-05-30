@@ -1,4 +1,5 @@
 # Uchikomi
+![Uchikomi](./UCHIKOMI.png)
 
 Uchikomi is a high-performance, deterministic telemetry engine written in Rust. It serves as the **ground truth** for autonomous AI refactoring agents by correlating Abstract Syntax Tree (AST) complexity with historical change patterns (Git).
 
